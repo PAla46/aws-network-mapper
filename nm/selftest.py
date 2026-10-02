@@ -472,28 +472,54 @@ def run_self_test(verbose: bool = True) -> int:
     try:
         rc = main(["--demo", "--out", out, "--quiet"])
         c.eq("demo run exits 0", rc, 0)
-        expected_files = [
-            "report.md",
-            "inventory.json",
-            "00-overview.mmd",
-            "01-transit-gateways.mmd",
-            "02-internet-paths.mmd",
-            "findings/findings.md",
-            "findings/findings.csv",
-            "reports/routes.csv",
-            "reports/subnets.csv",
-            "reports/cross-vpc-connectivity.csv",
-            "reports/load-balancer-flows.csv",
-            "reports/internet-exposure.csv",
-            "reports/cidr-map.csv",
-        ]
-        for name in expected_files:
-            c.check(f"demo output has {name}", os.path.exists(os.path.join(out, name)))
+
+        # Default output is diagrams only. Reports are opt-in via --reports.
+        for name in ("START-HERE.md", "00-overview.mmd", "01-transit-gateways.mmd", "02-internet-paths.mmd"):
+            c.check(f"default output has {name}", os.path.exists(os.path.join(out, name)))
+        for name in ("report.md", "inventory.json", "findings", "reports"):
+            c.check(
+                f"default output has no {name}",
+                not os.path.exists(os.path.join(out, name)),
+            )
+        c.check(
+            "default output is small",
+            len([f for f in os.listdir(out) if f.endswith(".mmd")]) == 3,
+            str(sorted(os.listdir(out))),
+        )
         c.check(
             "per-VPC diagrams written",
             any(f.startswith("eu-west-1-") for f in os.listdir(os.path.join(out, "vpcs"))),
         )
-        rc = main(["--demo", "--out", out, "--quiet", "--no-diagrams", "--no-reports", "--no-rules"])
+        c.check(
+            "no per-subnet diagrams without --deep",
+            not os.path.isdir(os.path.join(out, "subnets")),
+        )
+        start = open(os.path.join(out, "START-HERE.md"), encoding="utf-8").read()
+        c.check("START-HERE lists the overview diagram", "00-overview.mmd" in start)
+        c.check("START-HERE explains how to render", "mermaid.live" in start)
+        c.check("START-HERE lists findings", "NET0" in start)
+
+        out2 = tempfile.mkdtemp(prefix="nm-cli-rep-")
+        try:
+            rc = main(["--demo", "--out", out2, "--quiet", "--reports"])
+            c.eq("--reports run exits 0", rc, 0)
+            for name in (
+                "report.md",
+                "inventory.json",
+                "findings/findings.md",
+                "findings/findings.csv",
+                "reports/routes.csv",
+                "reports/subnets.csv",
+                "reports/cross-vpc-connectivity.csv",
+                "reports/load-balancer-flows.csv",
+                "reports/internet-exposure.csv",
+                "reports/cidr-map.csv",
+            ):
+                c.check(f"--reports writes {name}", os.path.exists(os.path.join(out2, name)))
+        finally:
+            shutil.rmtree(out2, ignore_errors=True)
+
+        rc = main(["--demo", "--out", out, "--quiet", "--no-diagrams", "--no-rules"])
         c.eq("flags are accepted together", rc, 0)
     finally:
         shutil.rmtree(out, ignore_errors=True)

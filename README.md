@@ -1,41 +1,51 @@
 # aws-network-mapper
 
 Read-only AWS network and route topology mapper. It collects VPCs, subnets, route
-tables and the resources attached to them, renders Mermaid diagrams, evaluates
-whether traffic *could* flow along a path, and writes CSV/Markdown evidence for
-audit work.
+tables and the resources attached to them, then draws how it all connects: which
+route tables exist, where the internet gateway goes, what hangs off the transit
+gateway, and what can reach what.
+
+Output is Mermaid diagrams by default. Pass `--reports` if you also want CSV and
+Markdown evidence.
 
 It only calls `Describe*` and `List*` APIs. It never creates, modifies or deletes
 anything.
 
 ## What it produces
 
+Default output is diagrams only:
+
 ```
 <out>/
+  START-HERE.md              what to open first, and every finding in a table
   00-overview.mmd            all VPCs, TGWs, peerings, IGWs, on-prem, internet
   01-transit-gateways.mmd    attachments, TGW route tables, associations
   02-internet-paths.mmd      IGWs, NAT gateways, public subnets, EIPs
-  vpcs/<region>-<name>-<id>.mmd
-  subnets/<region>-<name>-<id>.mmd      (with --deep)
-  inventory.json             full normalized snapshot
-  report.md                  human-readable summary
+  vpcs/<region>-<name>-<id>.mmd    one per VPC: subnets, route tables, gateways
+  logs/run.log
+```
+
+Add `--deep` for a per-subnet file under `subnets/`, or `--reports` for the
+CSV/Markdown evidence set:
+
+```
+  report.md                  summary
   findings/findings.md       findings grouped by severity
   findings/findings.csv      same findings, one row each
   reports/routes.csv         every route, normalised
-  reports/resources.csv      workloads and gateway resources
-  reports/subnets.csv
+  reports/subnets.csv        reports/resources.csv        reports/security-groups.csv
   reports/network-interfaces.csv
-  reports/security-groups.csv
-  reports/cross-vpc-connectivity.csv
-  reports/load-balancer-flows.csv
-  reports/internet-exposure.csv
-  reports/cidr-map.csv
-  logs/run.log
+  reports/cross-vpc-connectivity.csv     reports/load-balancer-flows.csv
+  reports/internet-exposure.csv          reports/cidr-map.csv
+  inventory.json             full normalized snapshot
   .cache/                    raw API responses, for offline rebuilds
 ```
 
-Diagrams are `.mmd` text so they can be rendered wherever you like: paste into
-<https://mermaid.live>, or `npx -y @mermaid-js/mermaid-cli -i 00-overview.mmd -o overview.svg`.
+Each `.mmd` file is Mermaid text. Paste one into <https://mermaid.live>, or render:
+
+```bash
+npx -y @mermaid-js/mermaid-cli -i 00-overview.mmd -o overview.svg
+```
 
 ## Running it in CloudShell
 
@@ -53,17 +63,20 @@ Start narrower while you are tuning the options:
 python3 aws_network_mapper.py --regions eu-west-1,us-east-1 --out ./map
 ```
 
+Then open `./map/START-HERE.md`, which lists every diagram and every finding.
+
 Useful flags:
 
 | Flag | Effect |
 | --- | --- |
 | `--all-regions` | scan every region enabled for the account |
-| `--deep` | per-subnet drill-down diagrams and more cross-VPC pairs |
+| `--deep` | also write a per-subnet diagram for every subnet |
+| `--reports` | also write the CSV/JSON/Markdown evidence files |
 | `--services core-only` | skip ELBv2, RDS, ECS, EKS, Lambda (faster, fewer permissions) |
 | `--cache-dir DIR` | cache location, default `<out>/.cache` |
 | `--offline` | rebuild all output from the cache, no AWS calls at all |
 | `--no-cache` | neither read nor write the cache |
-| `--no-diagrams` / `--no-reports` / `--no-rules` | skip parts of the output |
+| `--no-diagrams` / `--no-rules` | skip diagrams, or the findings that annotate them |
 | `--max-workers N` | parallel API calls per region (default 8) |
 | `-q` | quieter console output |
 

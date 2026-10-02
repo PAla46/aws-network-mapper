@@ -368,6 +368,71 @@ def findings_markdown(findings: Sequence[Finding], topo: Topology) -> str:
     return "\n".join(lines) + "\n"
 
 
+def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: Sequence[str]) -> str:
+    """The one page to open first: what the diagrams answer, and the findings."""
+    lines = [
+        "# Start here",
+        "",
+        f"- Account: {topo.account_id or 'unknown'} ({topo.partition})",
+        f"- Regions: {', '.join(topo.regions) or '-'}",
+        f"- VPCs {len(topo.vpcs)}, subnets {len(topo.subnets)}, "
+        f"route tables {len(topo.route_tables)}, transit gateways {len(topo.tgws)}, "
+        f"peerings {len(topo.peerings)}, internet gateways {len(topo.igws)}",
+        "",
+        "Each `.mmd` file is Mermaid text. Paste one into <https://mermaid.live>, or render:",
+        "",
+        "```",
+        "npx -y @mermaid-js/mermaid-cli -i 00-overview.mmd -o overview.svg",
+        "```",
+        "",
+        "## Diagrams",
+        "",
+        "| File | What it shows |",
+        "| --- | --- |",
+    ]
+    described = {
+        "00-overview.mmd": "every VPC, transit gateway attachment, peering, internet gateway and on-prem VPN",
+        "01-transit-gateways.mmd": "transit gateway attachments, their route tables and associations",
+        "02-internet-paths.mmd": "internet gateways, NAT gateways, public subnets and elastic IPs",
+    }
+    vpc_files = [d for d in diagrams if d.startswith("vpcs/")]
+    sub_files = [d for d in diagrams if d.startswith("subnets/")]
+    for name in diagrams:
+        if not name.startswith(("vpcs/", "subnets/")):
+            lines.append(f"| `{name}` | {described.get(name, 'topology')} |")
+    if vpc_files:
+        lines.append(f"| `vpcs/` ({len(vpc_files)}) | one file per VPC: subnets, route tables, gateways, workloads |")
+    if sub_files:
+        lines.append(f"| `subnets/` ({len(sub_files)}) | one file per subnet: route table, gateways, workloads |")
+    if not vpc_files and not sub_files:
+        lines.append("| _(none)_ | |")
+
+    lines += ["", "## Findings", ""]
+    if findings:
+        order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        counts: Dict[str, int] = {}
+        for f in findings:
+            counts[f.severity] = counts.get(f.severity, 0) + 1
+        summary = ", ".join(f"{counts[s]} {s}" for s in sorted(counts, key=lambda x: order.get(x, 9)))
+        lines += [f"{len(findings)} total: {summary}.", ""]
+        by_rule: Dict[str, List[str]] = {}
+        for f in findings:
+            by_rule.setdefault(f.rule_id, []).append(f.resource)
+        lines += ["| Rule | Severity | Resources |", "| --- | --- | --- |"]
+        sev = {f.rule_id: f.severity for f in findings}
+        title = {f.rule_id: f.title for f in findings}
+        for rule_id in sorted(by_rule):
+            res = ", ".join(f"`{r}`" for r in sorted(set(by_rule[rule_id]))[:6])
+            more = len(set(by_rule[rule_id])) - 6
+            if more > 0:
+                res += f" (+{more} more)"
+            lines.append(f"| `{rule_id}` | {sev[rule_id]} | {res} |")
+        lines += ["", "A warning icon on a node in a diagram marks a finding on it.", ""]
+    else:
+        lines.append("None.", "")
+    return "\n".join(lines) + "\n"
+
+
 def main_markdown(
     topo: Topology,
     findings: Sequence[Finding],

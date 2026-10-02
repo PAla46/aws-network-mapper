@@ -26,8 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="aws-network-mapper",
         description=(
             "Read-only AWS network and route topology mapper. Collects VPCs, subnets, "
-            "route tables and attached resources, renders Mermaid diagrams, evaluates "
-            "connectivity and produces audit CSV/Markdown output."
+            "route tables and attached resources, then draws how everything connects. "
+            "Diagrams only by default; pass --reports for CSV/Markdown evidence."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -64,9 +64,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"comma separated subset of: {','.join(SERVICE_CHOICES)} (default: all)",
     )
     parser.add_argument("--max-workers", type=int, default=8, help="parallel API calls per region")
+    parser.add_argument(
+        "--reports",
+        action="store_true",
+        help="also write CSV/JSON/Markdown evidence (off by default)",
+    )
     parser.add_argument("--no-diagrams", action="store_true", help="skip Mermaid diagrams")
-    parser.add_argument("--no-reports", action="store_true", help="skip CSV/JSON reports")
-    parser.add_argument("--no-rules", action="store_true", help="skip the findings engine")
+    parser.add_argument(
+        "--no-rules",
+        action="store_true",
+        help="do not annotate diagrams with findings",
+    )
     parser.add_argument(
         "--deep",
         action="store_true",
@@ -184,21 +192,29 @@ def finish(snapshots: Sequence[AccountSnapshot], out_dir: str, logger: Logger, a
     if topo.error_count:
         logger(f"warning: {topo.error_count} collection error(s) - see the run log")
 
-    engine = PathEngine(topo)
-    started = time.time()
-    cross_rows = analysis.evaluate_cross_vpc(topo, engine, max_pairs=args.max_vpc_pairs)
-    lb_rows = analysis.evaluate_lb_flows(topo, engine)
-    exposure = analysis.internet_exposure(topo)
-    cidr_rows = analysis.cidr_map(topo)
-    logger(
-        f"connectivity: {len(cross_rows)} cross-VPC evaluations, {len(lb_rows)} LB flows "
-        f"({time.time() - started:.1f}s)"
-    )
-
+    # Findings are cheap and they annotate the diagrams, so they always run.
     findings: List[Finding] = []
     if not args.no_rules:
         findings = run_rules(topo)
         logger(f"findings: {len(findings)} across {len({f.rule_id for f in findings})} rules")
+
+    # The pairwise connectivity analysis is the expensive part and is only needed
+    # for the CSV/Markdown evidence, so it only runs with --reports.
+    cross_rows: list = []
+    lb_rows: list = []
+    exposure: list = []
+    cidr_rows: list = []
+    if args.reports:
+        engine = PathEngine(topo)
+        started = time.time()
+        cross_rows = analysis.evaluate_cross_vpc(topo, engine, max_pairs=args.max_vpc_pairs)
+        lb_rows = analysis.evaluate_lb_flows(topo, engine)
+        exposure = analysis.internet_exposure(topo)
+        cidr_rows = analysis.cidr_map(topo)
+        logger(
+            f"connectivity: {len(cross_rows)} cross-VPC evaluations, {len(lb_rows)} LB flows "
+            f"({time.time() - started:.1f}s)"
+        )
 
     meta = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -211,7 +227,8 @@ def finish(snapshots: Sequence[AccountSnapshot], out_dir: str, logger: Logger, a
     diagram_index: List[str] = []
     if not args.no_diagrams:
         diagram_index = write_diagrams(topo, findings, out_dir, args, logger)
-    if not args.no_reports:
+        report.write_text(os.path.join(out_dir, "START-HERE.md"), report.start_here_markdown(topo, findings, diagram_index))
+    if args.reports:
         write_reports(topo, findings, cross_rows, lb_rows, exposure, cidr_rows, meta, out_dir, logger)
 
     print_summary(topo, findings, cross_rows, lb_rows, exposure, out_dir, diagram_index, args)
@@ -221,7 +238,7 @@ def finish(snapshots: Sequence[AccountSnapshot], out_dir: str, logger: Logger, a
 def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger) -> List[str]:
     written: List[str] = []
     vpc_dir = report.ensure_dir(os.path.join(out_dir, "vpcs"))
-    subnet_dir = report.ensure_dir(os.path.join(out_dir, "subnets"))
+    subnet_dir = os.path.join(out_dir, "subnets")
 
     def save(name: str, content: str) -> None:
         path = os.path.join(out_dir, name)
@@ -245,13 +262,13 @@ def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger)
         )
         written.append(f"vpcs/{fname}")
 
-    interesting = {f.resource for f in findings if f.resource_type == "AWS::EC2::Subnet"}
-    if args.deep:
-        interesting |= set(topo.subnets)
+    # Per-subnet drill-downs are only useful when chasing a specific path.
+    interesting = set(topo.subnets) if args.deep else set()
     for subnet_id in sorted(interesting)[: args.max_drilldown]:
         if subnet_id not in topo.subnets:
             continue
         fname = f"{topo.subnets[subnet_id].region}-{mermaid.slug(topo.subnets[subnet_id].name)}-{subnet_id}.mmd"
+        report.ensure_dir(subnet_dir)
         report.write_text(
             os.path.join(subnet_dir, fname),
             mermaid.render_subnet(topo, subnet_id),
@@ -339,26 +356,31 @@ def print_summary(
         print(f"  load balancer flows evaluated: {len(lb_rows)}  not reachable: {len(bad)}")
         for row in bad[:10]:
             print(f"    ! {row.lb} -> {row.target} ({row.target_ip}): {row.verdict}  {row.reasons[:100]}")
-    print(f"  internet-exposed addresses: {len(exposure)}")
+    if exposure:
+        print(f"  internet-exposed addresses: {len(exposure)}")
     if findings:
         order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        top = sorted(findings, key=lambda f: (order.get(f.severity, 9), f.rule_id))[:12]
+        top = sorted(findings, key=lambda f: (order.get(f.severity, 9), f.rule_id))[:5]
         print(f"  findings: {len(findings)}")
         for f in top:
             print(f"    [{f.severity:8}] {f.rule_id} {f.title} :: {f.resource}")
         if len(findings) > len(top):
-            print(f"    ... {len(findings) - len(top)} more (see findings/findings.md)")
+            where = "findings/findings.md" if args.reports else "START-HERE.md"
+            print(f"    ... {len(findings) - len(top)} more (see {where})")
     else:
         print("  findings: none")
     print("=" * 72)
     print(f"Output: {os.path.abspath(out_dir)}")
-    print(f"  report:   {os.path.join(out_dir, 'report.md')}")
-    print(f"  findings: {os.path.join(out_dir, 'findings', 'findings.md')}")
-    print(f"  routes:   {os.path.join(out_dir, 'reports', 'routes.csv')}")
-    if diagram_index and not args.no_diagrams:
-        print(f"  diagrams: {len(diagram_index)} .mmd files (00-overview.mmd first)")
+    if diagram_index:
+        print(f"  start at: {os.path.join(out_dir, 'START-HERE.md')}")
+        print(f"  overview: {os.path.join(out_dir, '00-overview.mmd')}")
+        print(f"  diagrams: {len(diagram_index)} .mmd files total")
+    if args.reports:
+        print(f"  reports:  {os.path.join(out_dir, 'reports', 'routes.csv')} (+8 more)")
+    else:
+        print("  (add --reports for CSV/Markdown evidence)")
     print()
-    print("Render Mermaid: open https://mermaid.live and paste the .mmd text, or")
+    print("View a diagram: open https://mermaid.live and paste the .mmd text, or")
     print("  npx -y @mermaid-js/mermaid-cli -i 00-overview.mmd -o overview.svg")
 
 
