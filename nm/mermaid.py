@@ -56,6 +56,11 @@ def slug(text: str, limit: int = 40) -> str:
 ESCAPE_RE = re.compile("[" + re.escape("".join(ESCAPES)) + "]")
 
 
+# Mermaid link tokens, from the flowchart link table. A bare "->" or "-.-" is NOT
+# valid: the lexer splits them and reports "got 'MINUS'".
+VALID_LINK_STYLES = frozenset({"-->", "---", "-.->", "==>", "===", "<-.->", "<-->", "<==>"})
+
+
 def esc(text: object) -> str:
     """Escape a label in a single pass (never escape our own escapes).
 
@@ -127,6 +132,10 @@ class MermaidBuilder:
         style: str = "-->",
         label_limit: int = 40,
     ) -> None:
+        if style not in VALID_LINK_STYLES:
+            raise ValueError(
+                f"invalid mermaid link style {style!r}; expected one of {sorted(VALID_LINK_STYLES)}"
+            )
         a, b = self.nid(src), self.nid(dst)
         body = f"  {a} {style}|{esc(trunc(label, label_limit))}| {b}" if label else f"  {a} {style} {b}"
         if body in self._edges:
@@ -508,7 +517,7 @@ def render_tgw(topo) -> str:
                 )
                 cls = "tgw" if att.state == "available" else "blocked"
                 b.node(akey, label, "hex", cls)
-                b.edge(tkey, akey, "", "->")
+                b.edge(tkey, akey, "", "-->")
                 for rtb in tgw.route_tables:
                     if att.id in rtb.associations:
                         b.edge(f"tgwrtb:{rtb.id}", akey, "associated", "-.->")
@@ -533,7 +542,7 @@ def render_internet(topo) -> str:
             "stadium",
             "igw" if igw.attached else "blocked",
         )
-        b.edge("internet", key, "", "->")
+        b.edge("internet", key, "", "-->")
         for subnet in topo.subnets_by_vpc.get(igw.vpc_id, []):
             rtb = topo.rtb_for_subnet(subnet.id)
             if not rtb:
@@ -549,8 +558,8 @@ def render_internet(topo) -> str:
                 for wl in topo.workloads_by_subnet.get(subnet.id, [])[:6]:
                     wkey = workload_key(wl)
                     b.node(wkey, workload_label(wl), "round", _workload_class(wl))
-                    b.edge(wkey, skey, style="-.-")
-            b.edge(key, skey, "public subnets", "->")
+                    b.edge(wkey, skey, style="-.->")
+            b.edge(key, skey, "public subnets", "-->")
     for nat in topo.nat_gateways.values():
         vpc = topo.vpcs.get(nat.vpc_id)
         key = f"nat:{nat.id}"
@@ -562,7 +571,7 @@ def render_internet(topo) -> str:
         )
         igw = topo.igw_for_vpc(nat.vpc_id)
         if igw:
-            b.edge(key, f"igw:{igw.id}", "outbound", "->")
+            b.edge(key, f"igw:{igw.id}", "outbound", "-->")
         for subnet in topo.subnets_by_vpc.get(nat.vpc_id, []):
             rtb = topo.rtb_for_subnet(subnet.id)
             if not rtb:
@@ -571,7 +580,7 @@ def render_internet(topo) -> str:
                 skey = f"sn:{subnet.id}"
                 if skey not in b._ids:
                     b.node(skey, f"{subnet.name}\n{subnet.cidr}\n{subnet.id}", "box", "private")
-                b.edge(skey, key, "default route", "->")
+                b.edge(skey, key, "default route", "-->")
     return b.render()
 
 

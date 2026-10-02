@@ -48,13 +48,49 @@ class Checker:
 
 
 NODE_DEF_RE = re.compile(r'^\s*(n\d+)[\[({\{]')
+# Only the tokens Mermaid actually accepts. A bare "->" or "-.-" lexes as MINUS and
+# fails with "Expecting 'SEMI', 'NEWLINE', ... got 'MINUS'".
 EDGE_RE = re.compile(
-    r"^\s*(n\d+)\s*(<-\.->|<-\.\.->|-\.\.->|-\.->|-->|==>|-\.-|->|<-)\s*"
+    r"^\s*(n\d+)\s*(<-\.->|<-\.\.->|-\.\.->|-\.->|-->|==>|<-->|===|<==>)\s*"
     r"(?:\|[^|]*\|\s*)?(n\d+)\s*$"
 )
+# Any dash run that is not one of the allowed link tokens.
+BAD_LINK_RE = re.compile(r"(?<![\w\"\[({|])(-+>|-+\.|-+\.[-.]+)(?![\w\"\[({|])")
 CLASS_RE = re.compile(r"^\s*class\s+(n\d+)\s")
 SUBGRAPH_RE = re.compile(r"^\s*subgraph\s+(sg\d+)\[")
 LABEL_RE = re.compile(r'(["\[])("(?:[^"\\]|\\.)*")\s*[\])]}')
+
+
+def _line_matching(text: str, needle: str) -> str:
+    for raw in text.splitlines():
+        if needle in raw and any(t in raw for t in ("-->", "-.->", "==>", "<-.->")):
+            return raw.strip()
+    return ""
+
+
+def _invalid_styles(diagrams: Dict[str, str]) -> List[str]:
+    """Link tokens in every diagram that Mermaid would not accept."""
+    bad: List[str] = []
+    token = re.compile(
+        "<-\.->|<-\.\.->|<-->|-\.\.->|-\.->|-\.-|-->|==>|===|<==>|---|==|->"
+    )
+    for name, text in diagrams.items():
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("%%") or "classDef" in line or "direction" in line:
+                continue
+            # only look at the part between two node ids (greedy so "-> n2" stays put)
+            m = re.match(r"^(\w+)\s+(.*)\s+(\w+)$", line)
+            if not m:
+                continue
+            # strip an edge label so dashes inside it are ignored
+            middle = re.sub(r"\|[^|]*\|", "", m.group(2)).strip()
+            if not re.fullmatch(r"[\w\[\]\(\){\}<>=.|-]+", middle):
+                continue
+            for run in token.findall(middle):
+                if run not in mermaid.VALID_LINK_STYLES:
+                    bad.append(f"{name}: {run!r} in {line!r}")
+    return bad
 
 
 def validate_mermaid(text: str) -> List[str]:
@@ -97,6 +133,12 @@ def validate_mermaid(text: str) -> List[str]:
             for nid in (m.group(1), m.group(3)):
                 if nid not in defined:
                     problems.append(f"edge references undefined node {nid}")
+            continue
+        bad = BAD_LINK_RE.search(line)
+        if bad:
+            problems.append(
+                f"invalid link token {bad.group(1)!r} (not a mermaid link): {line!r}"
+            )
             continue
         problems.append(f"unrecognised line: {line!r}")
     if depth != 0:
@@ -346,6 +388,24 @@ def run_self_test(verbose: bool = True) -> int:
             "#quot;" in diagrams["tricky-labels"] and "#124;" in diagrams["tricky-labels"]
             and "#35;" in diagrams["tricky-labels"] and "#lt;" in diagrams["tricky-labels"],
             diagrams["tricky-labels"])
+
+    # Regression: mermaid does not accept a bare "->" or "-.-" as a link. It lexes
+    # them as MINUS and fails with "got 'MINUS'". These spell out the real report.
+    c.check("every emitted link style is a real mermaid link token",
+            not _invalid_styles(diagrams), "; ".join(_invalid_styles(diagrams)[:4]))
+    try:
+        mermaid.MermaidBuilder("bad", "TB").edge("a", "b", "", "->")
+        c.check("edge() rejects an invalid link style", False, "no error raised for '->'")
+    except ValueError as exc:
+        c.check("edge() rejects an invalid link style", "->" in str(exc), str(exc))
+    broken = {
+        "internet": "flowchart TB\nn1([\"a\"])\nn2([\"b\"])\n  n1 -> n2\n  n1 -.- n2\n",
+        "ok": "flowchart TB\nn1([\"a\"])\nn2([\"b\"])\n  n1 -.-> n2\n",
+    }
+    caught = _invalid_styles(broken)
+    c.check("the link checker catches the reported bad styles",
+            any("'->'" in x for x in caught) and any("'-.-'" in x for x in caught), str(caught))
+    c.check("the link checker passes valid styles", not _invalid_styles({"ok": broken["ok"]}))
 
     # ---------------------------------------------------------------- reports
     print("\n[7/8] CSV / JSON / Markdown output")
