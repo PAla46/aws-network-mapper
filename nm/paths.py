@@ -28,6 +28,23 @@ CONDITIONAL = "conditional"
 UNKNOWN = "unknown"
 NOT_APPLICABLE = "n/a"
 
+# Security status shown on a path. Deliberately three values, not four:
+# a rule we could not evaluate must read as UNKNOWN, never as anything that
+# could be mistaken for a decision. "conditional" is a reachability notion and
+# collapses into UNKNOWN here on purpose.
+SG_ALLOWED = "allowed"
+SG_BLOCKED = "blocked"
+SG_UNKNOWN = "unknown"
+
+
+def security_status(sg_verdict: str) -> str:
+    """Map an internal verdict onto the three security statuses we publish."""
+    if sg_verdict == BLOCKED:
+        return SG_BLOCKED
+    if sg_verdict == REACHABLE:
+        return SG_ALLOWED
+    return SG_UNKNOWN
+
 PRIVATE_V4 = (
     "10.0.0.0/8",
     "172.16.0.0/12",

@@ -338,6 +338,25 @@ def _eu_west_1() -> Dict[str, Any]:
         "describe_instances": [{"Instances": _instances_eu()}],
         "elbv2.describe_load_balancers": _elb_eu(),
         "elbv2.describe_target_groups": [_target_group()],
+        # Listeners are the client-facing port. Without them the only port known
+        # is the registered target port, which is a different thing entirely.
+        f"elbv2.listeners:{_alb_slug()}": [
+            {
+                "ListenerArn": ALB_ARN + "/f2f7a8c1",
+                "LoadBalancerArn": ALB_ARN,
+                "Port": 443,
+                "Protocol": "HTTPS",
+                "DefaultTargetGroups": [{"TargetGroupArn": TG_APP_ARN}],
+                "SslPolicy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+            },
+            {
+                "ListenerArn": ALB_ARN + "/a1b2c3d4",
+                "LoadBalancerArn": ALB_ARN,
+                "Port": 80,
+                "Protocol": "HTTP",
+                "DefaultTargetGroups": [{"TargetGroupArn": TG_APP_ARN}],
+            },
+        ],
         "elbv2.target_health:tg-app/abc123": [
             {"Target": {"Id": "i-app-01", "Port": 8080, "AvailabilityZone": "eu-west-1a"}, "TargetHealth": {"State": "healthy"}},
             {"Target": {"Id": "i-app-02", "Port": 8080, "AvailabilityZone": "eu-west-1b"}, "TargetHealth": {"State": "healthy"}},
@@ -379,6 +398,11 @@ def json_dumps(obj: Any) -> str:
 
 TG_APP_ARN = "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/tg-app/abc123"
 ALB_ARN = "arn:aws:elasticloadbalancing:eu-west-1:111122223333:loadbalancer/app/my-alb/def456"
+
+
+def _alb_slug() -> str:
+    """The cache key suffix the collector derives from a load balancer ARN."""
+    return "/".join(ALB_ARN.split("/")[-2:])
 
 
 def _target_group() -> Dict[str, Any]:
@@ -458,7 +482,16 @@ def _eni(
     if public_ip:
         out["Association"] = {"PublicIp": public_ip}
     if instance:
-        out["Attachment"] = {"InstanceId": instance, "InstanceOwnerId": "111122223333"}
+        # The real API names this field Attachment.AttachmentId, not
+        # InstanceId. The previous fixture invented "InstanceId", which is why
+        # the test suite happily passed code that failed against live AWS.
+        out["Attachment"] = {
+            "AttachmentId": instance,
+            "InstanceOwnerId": "111122223333",
+            "Status": "attached",
+            "DeviceIndex": 0,
+            "DeleteOnTermination": True,
+        }
     return out
 
 
@@ -903,10 +936,48 @@ def _us_east_1() -> Dict[str, Any]:
                 },
             }
         ],
+        # Two RUNNING Fargate tasks, each with an ENI attachment carrying the
+        # task's private IP. This is the only authoritative source of a task
+        # endpoint -- desiredCount alone must never produce one.
+        "ecs.running_tasks:ingest": [
+            "arn:aws:ecs:us-east-1:111122223333:task/batch/ingest/aaa111",
+            "arn:aws:ecs:us-east-1:111122223333:task/batch/ingest/bbb222",
+        ],
+        "ecs.describe_tasks:ingest": [
+            {
+                "taskArn": "arn:aws:ecs:us-east-1:111122223333:task/batch/ingest/aaa111",
+                "lastStatus": "RUNNING",
+                "taskDefinitionArn": "arn:aws:ecs:us-east-1:111122223333:task-definition/ingest-prod:42",
+                "attachments": [
+                    {
+                        "id": "att-1",
+                        "type": "eni",
+                        "status": "ATTACHED",
+                        "details": [{"name": "subnetId", "value": "subnet-shared-1"},
+                                    {"name": "privateIPv4Address", "value": "172.16.1.90"}],
+                    }
+                ],
+            },
+            {
+                "taskArn": "arn:aws:ecs:us-east-1:111122223333:task/batch/ingest/bbb222",
+                "lastStatus": "RUNNING",
+                "taskDefinitionArn": "arn:aws:ecs:us-east-1:111122223333:task-definition/ingest-prod:42",
+                "attachments": [
+                    {
+                        "id": "att-2",
+                        "type": "eni",
+                        "status": "ATTACHED",
+                        "details": [{"name": "subnetId", "value": "subnet-shared-2"},
+                                    {"name": "privateIPv4Address", "value": "172.16.2.90"}],
+                    }
+                ],
+            },
+        ],
         "eks.list_clusters": ["platform"],
         "eks.describe_cluster": [
             {
                 "name": "platform",
+                "arn": "arn:aws:eks:us-east-1:111122223333:cluster/platform",
                 "status": "ACTIVE",
                 "version": "1.30",
                 "endpoint": "https://platform.eks.amazonaws.com",

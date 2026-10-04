@@ -62,39 +62,56 @@ A subnet container tells you *where* a resource lives. Each subnet header also
 carries its id, CIDR, AZ, associated route table, NACL, and classification.
 
 **Arrows are traffic paths.** Every arrow is labelled with the route that
-justifies it, so you can look at any line and know why it exists:
+justifies it, so you can look at any line and know why it exists. The label names
+the *route*, never the node it points at — the arrowhead already says where it
+goes:
 
 ```
-0.0.0.0/0 → Internet Gateway
-0.0.0.0/0 → NAT Gateway
-10.30.0.0/16 → Transit Gateway
-172.16.0.0/16 → VPC Peering
-TCP :8080
+0.0.0.0/0
+10.30.0.0/16
+172.16.0.0/16
+10.0.0.0/16 local
 TCP :5432
-via 10.0.0.0/16 local
 ```
+
+Each journey is drawn **once, in the direction traffic travels**. Inbound is
+`INTERNET → IGW → public subnet → ALB`; outbound is
+`private subnet → NAT → IGW → INTERNET`. A mirrored pair of arrows is not drawn
+just because the reverse is also possible.
+
+### Security status
+
+Every path edge states its security status, so "the route exists" is never
+mistaken for "the traffic gets through":
+
+```
+security: allowed
+security: blocked
+security: unknown
+```
+
+`unknown` means the rules could not be fully evaluated — a missing permission, or
+an ENI whose security groups were not collected. It is deliberately not the same
+as `allowed`, and never folded into `blocked`.
 
 ### Reading a path
 
 ```
 INTERNET
-  |  0.0.0.0/0 → Internet Gateway
+  |  inbound to vpc-prod
   v
 Internet Gateway  --(inbound to 10.0.1.0/24)-->
   v
 PUBLIC SUBNET 10.0.1.0/24          <- where the ALB lives
   |
-  |  TCP :443
+  |  terminates here :443   security: allowed
   v
 ALB
-  |  TCP :8080   via 10.0.0.0/16 local
+  |  HTTPS:443 / TG: app-tg / 10.0.0.0/16 local / security: allowed
   v
 PRIVATE SUBNET 10.0.10.0/24        <- where the app server lives
   |
-  |  TCP :5432   via 10.0.0.0/16 local
-  v
-ISOLATED SUBNET 10.0.20.0/24       <- where the database lives
-  |
+  |  TCP :5432   10.0.0.0/16 local   security: allowed
   v
 RDS PostgreSQL
 ```
@@ -105,15 +122,21 @@ And independently, the egress story for the same private subnet:
 EC2
   v
 PRIVATE SUBNET
-  |  0.0.0.0/0 → NAT Gateway
+  |  0.0.0.0/0
   v
-NAT Gateway (public, eu-west-1a / 10.0.1.0/24)
+NAT Gateway (public, in subnet-pub-1 · 10.0.1.0/24 · eu-west-1a)
   |  via public subnet
   v
 Internet Gateway
+  |  egress
   v
 INTERNET
 ```
+
+A **target group is not a node**: it is metadata on the arrow that uses it, since
+traffic is delivered to the instances, not to the group. An ALB arrow is only
+drawn when the target group has a real registration for that target — an empty
+target group produces no arrow rather than a hopeful one.
 
 ### What is deliberately *not* a node
 
@@ -131,10 +154,17 @@ not nodes here:
 | Security group | ENI-level filtering | `SG: sg-...` plus inbound rules in the resource node |
 | Resource | where traffic terminates | node inside its subnet |
 
-`local` is not drawn as a "Local Gateway" either. `10.0.0.0/16 → local` is
+`local` is not drawn as a "Local Gateway" either. `10.0.0.0/16 local` is
 intra-VPC routing, so it appears in an *arrow label* and the arrow runs straight
 from the source resource to the destination resource across the subnet
 containers that contain them.
+
+When a diagram hits its size budget, subnet headers and workload detail are shed
+first. **Network components are never shed**: a NAT gateway, IGW, TGW, peering,
+VPN gateway or VPC endpoint that an arrow points at is always drawn, even when
+its own subnet could not be. Hiding one would turn "this path exists" into "I
+could not draw this path", which is a different claim. A NAT whose subnet is
+missing from the inventory still appears, annotated with the subnet it expects.
 
 ### Subnet classification comes from routing
 
@@ -266,8 +296,8 @@ The default service set additionally uses `elasticloadbalancing:DescribeLoadBala
 `elasticloadbalancing:DescribeTargetGroups`,
 `elasticloadbalancing:DescribeTargetHealth`, `elasticloadbalancing:DescribeListeners`,
 `elasticloadbalancing:DescribeRules`, `rds:DescribeDBInstances`,
-`ecs:DescribeServices`, `ecs:DescribeTaskDefinitions`, `ecs:ListClusters`,
-`ecs:ListTasks`, `ecs:ListServices`, `ecs:DescribeClusters`,
+`ecs:DescribeServices`, `ecs:DescribeTaskDefinitions`, `ecs:DescribeTasks`,
+`ecs:ListClusters`, `ecs:ListTasks`, `ecs:ListServices`, `ecs:DescribeClusters`,
 `eks:DescribeClusters`, `eks:DescribeNodegroups`, `lambda:ListFunctions`.
 
 Any missing permission is recorded in `logs/run.log` and in the

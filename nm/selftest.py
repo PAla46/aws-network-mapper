@@ -187,6 +187,42 @@ def run_self_test(verbose: bool = True) -> int:
     c.eq("us-east-1 Lambda functions", len([w for w in us.workloads if w.kind == "lambda"]), 1)
 
     # ---------------------------------------------------------------- topology
+    # The fixtures must look like the real API. They previously invented
+    # Attachment.InstanceId, a field describe_network_interfaces never returns,
+    # which hid a bug that made every ALB -> target path untraceable on live AWS.
+    def _walk_attachments(node, path=""):
+        found = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "Attachment" and isinstance(v, dict):
+                    found.append((path, sorted(v)))
+                found.extend(_walk_attachments(v, f"{path}/{k}"))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                found.extend(_walk_attachments(v, f"{path}[{i}]"))
+        return found
+
+    att_fixtures = []
+    for region, payload in fixtures.items():
+        for key, value in payload.items():
+            att_fixtures.extend(_walk_attachments(value, f"{region}/{key}"))
+    c.check("fixtures never use the non-existent Attachment.InstanceId field",
+            all("InstanceId" not in keys for _p, keys in att_fixtures),
+            str([p for p, k in att_fixtures if "InstanceId" in k]))
+    c.check("fixtures model the real Attachment.AttachmentId field",
+            any("AttachmentId" in keys for _p, keys in att_fixtures),
+            str(att_fixtures[:3]))
+
+    # And the linkage the code actually depends on must be present.
+    eni_by_inst = {e.attachment_id: e for e in eu.enis if e.attachment_id}
+    ec2_ids = {w.id for w in eu.workloads if w.kind == "ec2"}
+    c.check("every EC2 fixture instance has an ENI attached via AttachmentId",
+            ec2_ids <= set(eni_by_inst),
+            f"missing={sorted(ec2_ids - set(eni_by_inst))}")
+    c.check("instance_id is derived only for i- attachments",
+            all((e.instance_id == e.attachment_id) if e.attachment_id.startswith("i-")
+                else (e.instance_id == "") for e in eu.enis))
+
     print("\n[2/8] topology indexes and subnet -> route table resolution")
     topo = Topology(snapshots)
     c.eq("regions", topo.regions, ["eu-west-1", "us-east-1"])
@@ -413,8 +449,15 @@ def run_self_test(verbose: bool = True) -> int:
     c.check("every arrow label names a destination or a port",
             all(e.label for e in fmodel.edges))
     c.check("gateway arrows carry the route destination",
-            any("0.0.0.0/0 \u2192 NAT Gateway" == e.label for e in fmodel.edges)
-            and any("0.0.0.0/0 \u2192 Internet Gateway" == e.label for e in fmodel.edges))
+            any(e.dst == flow.nid("nat", "nat-prod") and e.label == "0.0.0.0/0"
+                for e in fmodel.edges)
+            and any(e.dst == flow.nid("igw", "igw-prod") and e.label == "0.0.0.0/0"
+                    for e in fmodel.edges))
+    c.check("no arrow label repeats the node it points at",
+            not any(w in e.label for e in fmodel.edges
+                    for w in ("NAT Gateway", "Internet Gateway", "Transit Gateway")),
+            str([e.label for e in fmodel.edges
+                 if "Gateway" in e.label][:3]))
     c.check("workload arrows carry a port and a route",
             any(e.label.startswith("TCP :") and "local" in e.label for e in fmodel.edges))
     c.check("internet ingress reaches the ALB's public subnet",
@@ -424,20 +467,63 @@ def run_self_test(verbose: bool = True) -> int:
             any(e.dst == flow.nid("nat", "nat-prod") for e in fmodel.edges)
             and any(e.src == flow.nid("nat", "nat-prod")
                     and e.dst == flow.nid("igw", "igw-prod") for e in fmodel.edges))
-    c.check("ALB targets its registered targets on the target-group port",
+    c.check("ALB targets its registered targets on the listener port",
             any(e.src == flow.wid("def456") and e.dst == flow.wid("i-app-01")
-                and "TCP :8080" in e.label for e in fmodel.edges))
+                and "HTTPS:443" in e.label and "TG: tg-app" in e.label
+                for e in fmodel.edges),
+            str([e.label for e in fmodel.edges if e.src == flow.wid("def456")]))
+    c.check("a target group is never a node of its own",
+            not any("tg-app" in n for n in mermaid._known_node_ids(topo)))
     c.check("EC2 reaches RDS over the intra-VPC local route",
             any(e.src == flow.wid("i-app-01") and e.dst == flow.wid("db-prod-postgres")
                 and "TCP :5432" in e.label and "local" in e.label for e in fmodel.edges))
     c.check("RDS ENI is linked so the EC2 -> RDS path can be traced",
             bool(topo.workloads["db-prod-postgres"].eni_ids))
-    c.check("transit gateway only reaches attached VPCs",
-            all(topo.subnets[e.dst[len("s_"):].replace("_", "-")].vpc_id != v
-                for e in fmodel.edges if e.src == flow.nid("tgw", "tgw-hub")
-                for v in ("vpc-prod",) if False) or True)
+    # Section 12: a TGW arrow must land on a subnet in an *attached* VPC. The
+    # previous version of this check had `if False` in its generator plus a
+    # trailing `or True`, so it asserted nothing and could not fail.
+    attached_vpcs = {
+        a.resource_id for a in (topo.tgws["tgw-hub"].attachments or [])
+        if a.resource_type == "vpc"
+    }
+    tgw_targets = [
+        topo.subnets[e.dst[len("s_"):].replace("_", "-")]
+        for e in fmodel.edges
+        if e.src == flow.nid("tgw", "tgw-hub")
+        and e.dst.startswith("s_")
+    ]
+    c.check("the transit gateway actually reaches some subnets",
+            len(tgw_targets) > 0, f"{len(tgw_targets)} subnet(s)")
+    c.check("transit gateway only reaches subnets in attached VPCs",
+            all(sub.vpc_id in attached_vpcs for sub in tgw_targets),
+            str(sorted({sub.vpc_id for sub in tgw_targets}
+                       - attached_vpcs)))
     c.check("peering is only drawn where a route uses it",
             any(e.src == flow.nid("pcx", "pcx-prod-shared") for e in fmodel.edges))
+
+    # Identity: the workloads map is keyed by id, so two resources sharing an id
+    # silently overwrite each other and vanish from the diagram. This is a real
+    # bug that was present (ECS services were keyed by their *cluster* name).
+    ids = [w.id for w in topo.workloads.values()]
+    c.check("every workload has a unique id", len(ids) == len(set(ids)),
+            str(sorted({i for i in ids if ids.count(i) > 1})))
+    c.check("every ECS service keeps its own identity",
+            len({w.id for w in topo.workloads.values() if w.kind == "ecs-service"})
+            == len([w for w in topo.workloads.values() if w.kind == "ecs-service"]))
+
+    # Section 16: an unevaluated rule must never look like a permitted one.
+    # A "path" is an edge between two endpoints whose security groups can be
+    # evaluated. Subnet -> NAT and NAT -> IGW are routing hops with no SG pair.
+    path_edges = [e for e in fmodel.edges if e.kind == "target"]
+    c.check("every path edge states a security status",
+            all("security: " in e.label for e in path_edges),
+            str([e.label for e in path_edges if "security: " not in e.label][:3]))
+    c.check("security status is one of allowed/blocked/unknown",
+            all(any(f"security: {x}" in e.label for x in
+                    ("allowed", "blocked", "unknown")) for e in path_edges))
+    c.check("a blocked path is labelled as blocked",
+            all("security: blocked" in e.label
+                for e in path_edges if "blocked" in e.label.lower()))
 
     # The two hard prohibitions from the brief.
     c.check("no 'filtered by' edge anywhere", "filtered by" not in t)
@@ -645,11 +731,13 @@ def run_self_test(verbose: bool = True) -> int:
     c.check("a subnet routed to a VPN gateway continues on-premises",
             _has(vgw_node, onprem), str(_edge(vgw_node, onprem)))
     c.check("a VPN gateway is labelled by tunnel type, not 'VPN tunnel'",
-            any("IPsec" in lbl for _s, _d, lbl in _edge(onprem, vgw_node)),
-            str(_edge(onprem, vgw_node)))
+            any("IPsec" in lbl for _s, _d, lbl in _edge(vgw_node, onprem)),
+            str(_edge(vgw_node, onprem)))
     c.check("the VPN gateway internet leg names the on-premises network",
             all("on-premises" in lbl for _s, _d, lbl in _edge(vgw_node, net)),
             str(_edge(vgw_node, net)))
+    c.check("a journey is not drawn in both directions for its own sake",
+            _edge(onprem, vgw_node) == [], str(_edge(onprem, vgw_node)))
     c.check("a VPN gateway never claims a direct Internet Gateway hop",
             all("Internet Gateway" not in lbl for _s, _d, lbl in _edge(vgw_node, net)),
             str(_edge(vgw_node, net)))
@@ -684,7 +772,7 @@ def run_self_test(verbose: bool = True) -> int:
     dx_node = flow.nid("tgw", "tgw-dx")
     dx_edges = {(e.src, e.dst) for e in m4.edges}
     c.check("a TGW with a VPN attachment does get an on-premises leg",
-            (flow.onprem_node(), dx_node) in dx_edges, str(sorted(dx_edges)))
+            (dx_node, flow.onprem_node()) in dx_edges, str(sorted(dx_edges)))
     c.check("a TGW whose route table sends 0.0.0.0/0 to VPN does get an internet leg",
             (dx_node, flow.internet_node()) in dx_edges, str(sorted(dx_edges)))
 
@@ -796,8 +884,15 @@ def run_self_test(verbose: bool = True) -> int:
         m5 = flow.build_flow_model(topo5)
         t5 = mermaid.render_topology(topo5, m5)
         c.check("a NAT whose subnet was not collected still renders", True)
-        c.check("the unresolved NAT is labelled rather than silently dropped",
-                "OFF DIAGRAM" in t5)
+        c.check("a NAT whose subnet is missing still renders as a component",
+                "NAT GATEWAY<br/>nat-prod" in t5,
+                [x for x in t5.splitlines() if "NAT GATEWAY" in x])
+        c.check("that NAT says which subnet is missing",
+                "subnet-pub-1 not found in inventory" in t5,
+                [x for x in t5.splitlines() if "not found in inventory" in x])
+        c.check("no network component is ever a placeholder",
+                "OFF DIAGRAM" not in t5 and "OMITTED" not in t5,
+                [x for x in ("OFF DIAGRAM", "OMITTED") if x in t5])
         d5 = set(re.findall(r"^\s*(n\d+)[\[({]", t5, re.M))
         a5 = set()
         for line in t5.splitlines():

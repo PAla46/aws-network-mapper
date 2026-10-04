@@ -346,6 +346,7 @@ class Eni:
     interface_type: str = "interface"
     description: str = ""
     sg_ids: List[str] = field(default_factory=list)
+    attachment_id: str = ""
     instance_id: str = ""
     requester_managed: bool = False
     owner_id: str = ""
@@ -571,6 +572,7 @@ def eni_from(e: Dict[str, Any], region: str) -> Eni:
     primary = not addrs or bool(addrs[0].get("Primary")) or private == addrs[0].get(
         "PrivateIpAddress", ""
     )
+    attachment = (e.get("Attachment") or {}).get("AttachmentId", "")
     return Eni(
         id=e["NetworkInterfaceId"],
         region=region,
@@ -582,7 +584,15 @@ def eni_from(e: Dict[str, Any], region: str) -> Eni:
         interface_type=e.get("InterfaceType") or "interface",
         description=(e.get("Description") or "").strip(),
         sg_ids=[g["GroupId"] for g in e.get("Groups", []) or [] if g.get("GroupId")],
-        instance_id=(e.get("Attachment") or {}).get("InstanceId", ""),
+        # describe_network_interfaces has no Attachment.InstanceId. The field is
+        # Attachment.AttachmentId, and for an EC2 instance ENI that value *is*
+        # the instance id. Reading a non-existent key made instance_id always
+        # empty against real AWS, which silently broke every ALB -> target path
+        # (the target could never be resolved back to its ENI).
+        attachment_id=attachment,
+        # Only an EC2 instance attachment carries an i- id. For other attachment
+        # types (natgw-, elasticmapreduce-, eipassoc-) it is not an instance.
+        instance_id=attachment if attachment.startswith("i-") else "",
         requester_managed=bool(e.get("RequesterManaged")),
         owner_id=e.get("OwnerId") or "",
         status=e.get("Status", ""),

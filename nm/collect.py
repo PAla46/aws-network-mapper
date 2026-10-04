@@ -33,6 +33,36 @@ class CollectorError(Exception):
 # --------------------------------------------------------------------------- #
 
 
+def _describe_tasks(client, cluster_arn: str, arns: List[str], batch: int = 100) -> List[Dict[str, Any]]:
+    """describe_tasks in batches; the API caps each call."""
+    out: List[Dict[str, Any]] = []
+    for i in range(0, len(arns), batch):
+        resp = client.describe_tasks(cluster=cluster_arn, tasks=arns[i:i + batch])
+        out.extend(resp.get("tasks", []) or [])
+    return out
+
+
+def _attachment_value(attachment: Dict[str, Any], name: str) -> str:
+    """Pull one named value out of an ECS attachment.
+
+    ``details`` is a heterogeneous list -- subnetId, privateIPv4Address, ... --
+    so the entry has to be matched by name. Indexing position 0 and assuming it
+    is the IP yields the subnet id, and iterating the value as a collection
+    yields one character per letter.
+    """
+    for detail in attachment.get("details") or []:
+        if (detail.get("name") or "") == name:
+            return detail.get("value") or ""
+    return ""
+
+
+def _eni_sg_for_ip(snap, ip: str) -> List[str]:
+    for e in snap.enis:
+        if e.private_ip == ip:
+            return list(e.sg_ids)
+    return []
+
+
 def _paged(
     client,
     op: str,
@@ -670,6 +700,38 @@ class Collector:
             health = self._call(region, f"elbv2.target_health:{tg_slug}", fetch)
             tg_targets[tg["TargetGroupArn"]] = health
 
+        # Listeners are what give a path its port and protocol. Without them the
+        # only ports available are the registered target ports, which is not the
+        # port a client actually connects to.
+        listeners_by_lb: Dict[str, List[Dict[str, Any]]] = {}
+        for lb in raw:
+            lb_arn = lb["LoadBalancerArn"]
+            lb_slug = "/".join(lb_arn.split("/")[-2:])
+            try:
+                listeners = self._call(
+                    region,
+                    f"elbv2.listeners:{lb_slug}",
+                    lambda arn=lb_arn: _paged(
+                        client, "describe_listeners", "Listeners", LoadBalancerArn=arn
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                listeners = []
+            listeners_by_lb[lb_arn] = [
+                {
+                    "port": ln.get("Port", ""),
+                    "protocol": ln.get("Protocol", ""),
+                    # DefaultTargetGroups is a list of TargetGroupTuple objects
+                    # ({"TargetGroupArn": ..., "Weight": ...}), not bare ARNs.
+                    "tg_arns": [
+                        t.get("TargetGroupArn", "") if isinstance(t, dict) else str(t)
+                        for t in (ln.get("DefaultTargetGroups") or [])
+                    ],
+                    "ssl": bool(ln.get("SslPolicy")),
+                }
+                for ln in (listeners or [])
+            ]
+
         for lb in raw:
             lb_arn = lb["LoadBalancerArn"]
             lb_id = lb_arn.rsplit("/", 1)[-1]
@@ -685,19 +747,34 @@ class Collector:
             )
             targets: List[Dict[str, Any]] = []
             for tg in target_groups:
-                if lb_arn in (tg.get("LoadBalancerArns") or []):
-                    for th in tg_targets.get(tg["TargetGroupArn"], []):
-                        target = th.get("Target", {}) or {}
-                        targets.append(
-                            {
-                                "id": target.get("Id", ""),
-                                "port": target.get("Port", ""),
-                                "zone": target.get("AvailabilityZone", ""),
-                                "health": th.get("TargetHealth", {}).get("State", ""),
-                                "target_group": tg.get("TargetGroupName", ""),
-                                "type": tg.get("TargetType", "instance"),
-                            }
-                        )
+                if lb_arn not in (tg.get("LoadBalancerArns") or []):
+                    continue
+                tg_arn = tg["TargetGroupArn"]
+                # Which listener forwards to this group, and on what port. The
+                # listener port is the port the client uses; the target port is
+                # where the group delivers.
+                forwards = [
+                    {
+                        "port": ln["port"],
+                        "protocol": ln["protocol"],
+                        "ssl": ln["ssl"],
+                    }
+                    for ln in listeners_by_lb.get(lb_arn, [])
+                    if tg_arn in ln["tg_arns"]
+                ]
+                for th in tg_targets.get(tg_arn, []):
+                    target = th.get("Target", {}) or {}
+                    targets.append(
+                        {
+                            "id": target.get("Id", ""),
+                            "port": target.get("Port", ""),
+                            "zone": target.get("AvailabilityZone", ""),
+                            "health": th.get("TargetHealth", {}).get("State", ""),
+                            "target_group": tg.get("TargetGroupName", ""),
+                            "type": tg.get("TargetType", "instance"),
+                            "listeners": forwards,
+                        }
+                    )
             snap.workloads.append(
                 M.Workload(
                     id=lb_id,
@@ -713,7 +790,13 @@ class Collector:
                     engine=lb.get("Type", ""),
                     private_ips=[a.get("IpAddress", "") for a in azs if a.get("IpAddress")],
                     public_ips=[a.get("IpAddress", "") for a in azs if a.get("IpAddress") and scheme == "internet-facing"],
-                    extra={"scheme": scheme, "dns": dns, "type": lb.get("Type", ""), "targets": targets},
+                    extra={
+                        "scheme": scheme,
+                        "dns": dns,
+                        "type": lb.get("Type", ""),
+                        "targets": targets,
+                        "listeners": listeners_by_lb.get(lb_arn, []),
+                    },
                 )
             )
 
@@ -795,7 +878,9 @@ class Collector:
             subnets = list(vpc_cfg.get("subnetIds") or [])
             snap.workloads.append(
                 M.Workload(
-                    id=cluster.get("clusterName", ""),
+                    # The ARN is the only globally unique handle; two clusters in
+                    # in different regions can share a name.
+                    id=cluster.get("clusterArn") or cluster.get("clusterName", ""),
                     kind="ecs-cluster",
                     region=region,
                     vpc_id=vpc_cfg.get("vpcId", "") or self._guess_vpc_from_subnets(snap, subnets),
@@ -832,20 +917,114 @@ class Collector:
                 svc_subnets = list(awsvpc.get("subnets") or [])
                 if not svc_subnets:
                     continue
+                cluster_arn = cluster.get("clusterArn", "")
+                # Running tasks are the only authoritative source of a task's
+                # network attachment. desiredCount is an aspiration, not a fact,
+                # so a scaled-to-zero service must not be drawn with an endpoint.
+                tasks = self._collect_service_tasks(
+                    client, region, cluster_arn, svc.get("serviceArn", "")
+                )
+                # Read lastStatus straight off the payload. Deriving it inside
+                # _describe_tasks looked cleaner but silently produced "0 tasks"
+                # on every cached and --offline run, because _call hands back the
+                # raw stored payload without passing through that code.
+                running = [
+                    t for t in tasks if (t.get("lastStatus") or "") == "RUNNING"
+                ]
+                eni_attachments = [
+                    a
+                    for t in running
+                    for a in (t.get("attachments") or [])
+                    if a.get("type") == "eni"
+                ]
+                task_ips = sorted({
+                    ip
+                    for a in eni_attachments
+                    for ip in [_attachment_value(a, "privateIPv4Address")]
+                    if ip
+                })
+                task_subnets = sorted({
+                    sn
+                    for a in eni_attachments
+                    for sn in [_attachment_value(a, "subnetId")]
+                    if sn
+                })
+                sg_ids = list(awsvpc.get("securityGroups") or [])
+                for ip in task_ips:
+                    for g in _eni_sg_for_ip(snap, ip):
+                        if g not in sg_ids:
+                            sg_ids.append(g)
                 snap.workloads.append(
                     M.Workload(
-                        id=svc.get("serviceArn", "").rsplit("/", 2)[-2:][0] if svc.get("serviceArn") else "",
+                        # The ARN is the id. The old expression pulled the *cluster*
+                        # name out of the service ARN, so every service in a
+                        # cluster shared one id and overwrote its siblings in
+                        # the workloads map; only one could ever be drawn.
+                        id=svc.get("serviceArn") or svc.get("serviceName", ""),
                         kind="ecs-service",
                         region=region,
                         vpc_id=self._guess_vpc_from_subnets(snap, svc_subnets),
                         name=svc.get("serviceName", ""),
-                        subnet_ids=svc_subnets,
-                        sg_ids=list(awsvpc.get("securityGroups") or []),
+                        subnet_ids=task_subnets or svc_subnets,
+                        sg_ids=sg_ids,
+                        eni_ids=[
+                            e.id
+                            for e in snap.enis
+                            if e.private_ip in task_ips
+                        ],
+                        private_ips=task_ips,
                         state=svc.get("status", ""),
-                        detail=f"{svc.get('desiredCount', 0)} tasks",
-                        extra={"cluster": cluster.get("clusterName", ""), "launch_type": svc.get("launchType", "FARGATE")},
+                        detail=(
+                            f"{len(running)}/{svc.get('desiredCount', 0)} tasks running"
+                            if running
+                            else f"running tasks: 0 (desired {svc.get('desiredCount', 0)})"
+                        ),
+                        extra={
+                            "cluster": cluster.get("clusterName", ""),
+                            "launch_type": svc.get("launchType", "FARGATE"),
+                            "running_tasks": len(running),
+                            "desired_tasks": svc.get("desiredCount", 0),
+                            "task_ips": task_ips,
+                            "task_definitions": sorted({
+                                (t.get("taskDefinitionArn") or "").rsplit("/", 1)[-1]
+                                for t in running
+                                if t.get("taskDefinitionArn")
+                            }),
+                        },
                     )
                 )
+
+    def _collect_service_tasks(
+        self, client, region: str, cluster_arn: str, service_arn: str
+    ) -> List[Dict[str, Any]]:
+        """Describe the RUNNING tasks of one ECS service.
+
+        Failures degrade to an empty list rather than aborting the region: ECS
+        task APIs are frequently denied, and an absent task list must not be
+        confused with a service that genuinely has no running tasks.
+        """
+        if not cluster_arn or not service_arn:
+            return []
+        slug = service_arn.rsplit("/", 1)[-1]
+        try:
+            arns = self._call(
+                region,
+                f"ecs.running_tasks:{slug}",
+                lambda: list(
+                    _paged(client, "list_tasks", "taskArns",
+                           cluster=cluster_arn, serviceName=service_arn,
+                           desiredStatus="RUNNING")
+                ),
+            )
+            if not arns:
+                return []
+            return self._call(
+                region,
+                f"ecs.describe_tasks:{slug}",
+                lambda: _describe_tasks(client, cluster_arn, arns),
+            ) or []
+        except Exception:  # noqa: BLE001
+            return []
 
     def _collect_eks(self, pool, region: str, snap: AccountSnapshot) -> None:
         client = pool.get("eks")
@@ -868,7 +1047,7 @@ class Collector:
                 continue
             snap.workloads.append(
                 M.Workload(
-                    id=cluster.get("name", ""),
+                    id=cluster.get("arn") or cluster.get("name", ""),
                     kind="eks",
                     region=region,
                     vpc_id=vpc_cfg.get("vpcId", "") or self._guess_vpc_from_subnets(snap, subnets),
@@ -876,6 +1055,7 @@ class Collector:
                     subnet_ids=subnets,
                     sg_ids=list(vpc_cfg.get("securityGroupIds") or []),
                     state=cluster.get("status", ""),
+                    engine=str(cluster.get("version", "")),
                     detail=f"v{cluster.get('version', '?')}",
                     extra={"endpoint": cluster.get("endpoint", "")},
                 )

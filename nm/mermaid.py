@@ -42,6 +42,8 @@ CLASSES = {
     "onprem": ("fill:#e7e5e4,stroke:#57534e,color:#1c1917",),
     "blocked": ("fill:#fee2e2,stroke:#b91c1c,color:#450a0a",),
     "warn": ("stroke-dasharray:4 3",),
+    "component": ("fill:#e2e8f0,stroke:#334155,color:#0f172a",),
+    "summary": ("fill:#f8fafc,stroke:#0f172a,color:#0f172a",),
 }
 
 SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -253,6 +255,25 @@ def _known_node_ids(topo: Topology) -> Set[str]:
     return ids
 
 
+def _component_node_ids(topo: Topology) -> Set[str]:
+    """Node ids for network-path components that must never be omitted.
+
+    Section 14: when a diagram is over budget we shed subnet headers and
+    workload detail, never the gateways and NAT devices that a route arrow
+    points at. Hiding those would turn "this path exists" into "I could not
+    draw this path", which is a very different claim.
+    """
+    ids: Set[str] = set()
+    for kind, coll in (
+        ("igw", topo.igws), ("nat", topo.nat_gateways), ("tgw", topo.tgws),
+        ("pcx", topo.peerings), ("vpce", topo.endpoints), ("vgw", topo.vpn_gateways),
+    ):
+        ids.update(flow.nid(kind, r.id) for r in coll.values())
+    ids.add(flow.internet_node())
+    ids.add(flow.onprem_node())
+    return ids
+
+
 def render_topology(
     topo: Topology,
     model: Optional["flow.FlowModel"] = None,
@@ -336,7 +357,16 @@ def render_topology(
     # a placeholder rather than a dangling reference.
     referenced = {e.src for e in model.edges} | {e.dst for e in model.edges}
     known = _known_node_ids(topo)
-    for node in sorted(referenced - defined):
+    components = _component_node_ids(topo)
+    missing_components = (referenced - defined) & components
+    if missing_components:
+        # Should be unreachable: components are emitted regardless of the subnet
+        # budget. Drawing them here keeps the diagram valid if that ever breaks.
+        for node in sorted(missing_components):
+            b.node(node, f"{node.replace('_', ' ').upper()}\n(recovered)", "round", "component", 200)
+            defined.add(node)
+
+    for node in sorted((referenced - defined) - components):
         # Two very different reasons for a missing node, and conflating them
         # would send you hunting for a resource that is right there in the API.
         if node in known:
@@ -345,7 +375,7 @@ def render_topology(
             why = "not present in the inventory\nits subnet or VPC may have failed collection"
         b.node(
             node,
-            f"OFF DIAGRAM\n{node.replace('_', ' ')}\nreferenced by a route\n{why}",
+            f"OMITTED\n{node.replace('_', ' ')}\nreferenced by a route\n{why}",
             "round",
             "blocked",
             220,
@@ -409,6 +439,31 @@ def _emit_vpc(b, model, topo, vpc, defined: Set[str], budget: int) -> None:
             label.extend(model.notes.get(node, []))
             b.node(node, "\n".join(label), "hex", "peering", 220)
             defined.add(node)
+
+        # A NAT gateway lives in a subnet, but it is a *component* of the path,
+        # not subnet metadata. Emitting it here means the subnet budget can trim
+        # headers and workloads without ever turning a NAT into a placeholder.
+        for nat in topo.nat_by_vpc.get(vpc.id, []):
+            nat_node = flow.nid("nat", nat.id)
+            lines = [f"NAT GATEWAY\n{nat.id}"]
+            if nat.state:
+                lines.append(nat.state)
+            if nat.connect_type:
+                lines.append(f"{nat.connect_type}")
+            if nat.address:
+                lines.append(f"{nat.address}")
+            home = topo.subnets.get(nat.subnet_id or "")
+            if home is not None:
+                lines.append(f"in {home.id} · {home.cidr} · {home.az or '?'}")
+            nat_sgs: List[str] = []
+            for eni in topo.enis_by_subnet.get(nat.subnet_id or "", []):
+                if eni.interface_type == "natGateway" or nat.id in (eni.description or ""):
+                    nat_sgs = [x for x in eni.sg_ids]
+                    break
+            lines.append(f"SG: {', '.join(nat_sgs[:2])}" if nat_sgs else "SG: none")
+            lines.extend(model.notes.get(nat_node, []))
+            b.node(nat_node, "\n".join(lines), "round", "nat", 220)
+            defined.add(nat_node)
 
         for endpoint in topo.endpoints_by_vpc.get(vpc.id, []):
             node = flow.nid("vpce", endpoint.id)
@@ -488,28 +543,6 @@ def _emit_subnet(b, model, topo, vpc, subnet: Subnet, defined: Set[str], owned_e
         b.node(node, "\n".join(header), "box", cls if cls in CLASSES else "private", 220)
         defined.add(node)
 
-        # Resources that physically live here.
-        for nat in topo.nat_by_vpc.get(vpc.id, []):
-            if nat.subnet_id != subnet.id:
-                continue
-            nat_node = flow.nid("nat", nat.id)
-            lines = [f"NAT GATEWAY\n{nat.id}"]
-            if nat.state:
-                lines.append(nat.state)
-            if nat.connect_type:
-                lines.append(f"{nat.connect_type}")
-            if nat.address:
-                lines.append(nat.address)
-            nat_sgs: List[str] = []
-            for eni in topo.enis_by_subnet.get(subnet.id, []):
-                if eni.interface_type == "natGateway" or nat.id in (eni.description or ""):
-                    nat_sgs = [s for s in eni.sg_ids]
-                    break
-            lines.append(f"SG: {', '.join(nat_sgs[:2])}" if nat_sgs else "SG: none")
-            lines.extend(model.notes.get(nat_node, []))
-            b.node(nat_node, "\n".join(lines), "round", "nat", 220)
-            defined.add(nat_node)
-
         for wl in topo.workloads_by_subnet.get(subnet.id, []):
             _emit_workload(b, model, topo, wl, defined, cls)
 
@@ -540,55 +573,128 @@ def _classification_reason(info) -> str:
     return f"Type: {info.classification.upper()} \u2014 0.0.0.0/0 \u2192 {phrase}"
 
 
-def _emit_workload(b, model, topo, wl: Workload, defined: Set[str], subnet_class: str) -> None:
+def _emit_workload(
+    b,
+    model,
+    topo: Topology,
+    wl: Workload,
+    defined: Set[str],
+    subnet_class: str,
+    detail: str = "full",
+) -> None:
+    """One compact resource node.
+
+    Visual hierarchy is network path first, structure second, resources third,
+    security metadata fourth, AWS ids last. So a node leads with what it is and
+    where it lives, and keeps only the few facts that answer "how does traffic
+    reach this". ENI inventories, per-AZ placement lists and security group rule
+    dumps belong in the report, not on the diagram.
+    """
     node = flow.wid(wl.id)
     if node in defined:
         return
 
-    lines = [_workload_title(wl), wl.id]
+    lines = [_workload_title(wl)]
     eni = topo.primary_ip_for_workload(wl)
-    if eni is not None and eni.private_ip:
-        lines.append(f"ENI {eni.private_ip}")
-    if wl.engine and wl.kind not in ("alb", "nlb", "gwlb"):
-        lines.append(wl.engine)
-    if wl.extra.get("scheme"):
-        lines.append(f"{wl.extra['scheme']} {wl.kind.upper()}")
 
-    # A load balancer with ENIs in several subnets/AZs cannot be drawn inside all
-    # of them at once, so state the full placement instead of duplicating it.
-    if len(wl.subnet_ids) > 1:
-        places = []
-        for sid_ in wl.subnet_ids[:4]:
-            host = topo.subnets.get(sid_)
-            if host is not None:
-                places.append(f"{host.az}: {host.cidr}")
-        if places:
-            lines.append(f"ENIs in {len(wl.subnet_ids)} subnets")
-            lines.extend(places)
+    if wl.kind in ("alb", "nlb", "gwlb", "lb"):
+        # Section 10: ALB / name / scheme / SG. Listeners earn their line
+        # because they are where traffic actually enters.
+        scheme = wl.extra.get("scheme") or ""
+        if scheme:
+            lines.append("internet-facing" if scheme == "internet-facing" else "internal")
+        listeners = _listener_summary(wl)
+        if listeners:
+            lines.append(listeners)
+        if len(wl.subnet_ids) > 1:
+            lines.append(f"in {len(wl.subnet_ids)} subnets")
+    elif wl.kind == "rds":
+        port = wl.extra.get("port") or ""
+        engine = (wl.engine or "").strip()
+        lines.append(f"{engine} :{port}".strip().rstrip(":").strip() if port else engine)
+    elif wl.kind == "ecs-service":
+        running = wl.extra.get("running_tasks")
+        desired = wl.extra.get("desired_tasks")
+        if running is None:
+            lines.append("running tasks: unknown")
+        elif running:
+            lines.append(f"{running}/{desired} tasks running")
+        else:
+            # Section 14: a service scaled to zero is a valid state, and must not
+            # be drawn with an invented runtime endpoint.
+            lines.append(f"running tasks: 0 (desired {desired})")
+    elif wl.kind == "ec2":
+        if eni is not None and eni.private_ip:
+            lines.append(eni.private_ip)
+    elif wl.kind == "eks":
+        lines.append(f"v{wl.engine or '?'} control plane")
+    elif wl.kind == "lambda":
+        lines.append(wl.engine or "function")
+
+    if eni is not None and eni.private_ip and wl.kind not in ("alb", "nlb", "gwlb", "lb", "ec2"):
+        lines.append(eni.private_ip)
 
     sg_ids = list(wl.sg_ids)
     if not sg_ids and eni is not None:
         sg_ids = list(eni.sg_ids)  # RDS and friends carry their SGs on the ENI
     if sg_ids:
-        shown = sg_ids[:2]
-        extra = f" (+{len(sg_ids) - 2})" if len(sg_ids) > 2 else ""
-        lines.append(f"SG: {', '.join(shown)}{extra}")
-    else:
-        lines.append("SG: none (default VPC SG behaviour)")
+        lines.append(f"SG: {_short_sg_list(sg_ids)}")
+    elif detail == "full":
+        lines.append("SG: none")
 
-    for rule in _sg_ingress_summary(topo, sg_ids, MAX_SG_RULES)[:MAX_SG_RULES]:
-        lines.append(f"in {rule.split(': ', 1)[-1]}")
+    # The id is the last thing on the node: useful, never the headline. ARNs are
+    # abbreviated so a node never turns into a wall of text.
+    if detail == "full":
+        lines.append(_short_id(wl.id))
+
+    for note in model.notes.get(node, [])[:2]:
+        lines.append(note)
 
     b.node(node, "\n".join(lines), _workload_shape(wl),
-          subnet_class if subnet_class in CLASSES else "private", 320)
+           subnet_class if subnet_class in CLASSES else "private", 320)
     defined.add(node)
 
 
+def _short_id(raw: str) -> str:
+    """Abbreviate a long AWS identifier. Full value stays in the report."""
+    text = raw or ""
+    if text.startswith("arn:"):
+        tail = text.rsplit(":", 1)[-1]
+        parts = [seg for seg in tail.split("/") if seg]
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[-1]}"
+        return tail or text
+    return text
+
+
+def _listener_summary(wl: Workload) -> str:
+    """``443 HTTPS · 80 HTTP`` -- compact, and where traffic enters."""
+    seen: List[str] = []
+    for ln in wl.extra.get("listeners") or []:
+        proto = str(ln.get("protocol") or "")
+        port = ln.get("port")
+        text = f"{port} {proto}".strip() if port else proto
+        if text and text not in seen:
+            seen.append(text)
+    return " · ".join(seen[:4])
+
+
+def _short_sg_list(sg_ids: List[str]) -> str:
+    """Security group ids, abbreviated. Full ids live in the report."""
+    out = []
+    for sg in sg_ids[:2]:
+        out.append(sg if len(sg) <= 24 else sg[:20] + "..")
+    extra = f" (+{len(sg_ids) - 2})" if len(sg_ids) > 2 else ""
+    return ", ".join(out) + extra
+
+
 def _workload_title(wl: Workload) -> str:
-    kind = {"ec2": "EC2", "rds": "RDS", "alb": "ALB", "nlb": "NLB", "gwlb": "GWLB"}.get(
-        wl.kind, wl.kind.upper()
-    )
-    return f"{kind} {wl.name or wl.id}"
+    kind = {
+        "ec2": "EC2", "rds": "RDS", "alb": "ALB", "nlb": "NLB", "gwlb": "GWLB",
+        "ecs-cluster": "ECS CLUSTER", "ecs-service": "ECS SERVICE",
+        "eks": "EKS", "lambda": "LAMBDA",
+    }.get(wl.kind, wl.kind.upper())
+    return f"{kind} {wl.name or _short_id(wl.id)}"
 
 
 def _workload_shape(wl: Workload) -> str:
@@ -669,4 +775,28 @@ def _legend(b, topo, model, vpc_count: int) -> None:
     b.free("  %% 'local' is shown in an edge label only, never as a gateway node")
     b.free("  %% NACL appears in the subnet header; security groups in the resource node")
     b.free("  %% routes show configured reachability potential, not observed traffic")
+    _connectivity_summary(b, topo, model, vpc_count)
     _orphan_notes(b, topo)
+
+
+def _connectivity_summary(b, topo: Topology, model: "flow.FlowModel", vpc_count: int) -> None:
+    """A visible summary of what the map concluded.
+
+    Section 29. The ``%%`` legend above is invisible in the rendered image, so the
+    headline numbers get a real node: one place that states how much was drawn
+    and how much of it security allows, without the reader counting arrows.
+    """
+    regions = sorted({s.region for s in topo.subnets.values() if s.region})
+    lines = [
+        "CONNECTIVITY SUMMARY",
+        f"account {topo.account_id or 'n/a'} · {vpc_count} VPC(s) · "
+        f"{len(model.routing)} subnets",
+        f"regions: {', '.join(regions) if regions else 'n/a'}",
+        f"{len(model.edges)} network path(s) drawn",
+        f"workload paths — {model.traced} allowed / {model.blocked} blocked / "
+        f"{model.conditional} unknown",
+        "'unknown' = rules could not be fully evaluated",
+        "containers = where things live, arrows = configured paths",
+    ]
+    with b.subgraph("connectivity-summary", "SUMMARY"):
+        b.node("n_summary", "\n".join(lines), "box", "summary", 300)

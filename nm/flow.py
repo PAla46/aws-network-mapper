@@ -29,7 +29,13 @@ from typing import Dict, List, Optional
 
 from . import model as M
 from .cidrutil import ip_in_net, is_default_route, parse_net
-from .paths import BLOCKED, CONDITIONAL, PathEngine
+from .paths import (
+    SG_ALLOWED,
+    SG_BLOCKED,
+    SG_UNKNOWN,
+    PathEngine,
+    security_status,
+)
 from .topology import Topology
 
 PUBLIC = "public"
@@ -74,16 +80,17 @@ def target_kind(route: M.Route) -> str:
 
 
 def route_label(route: Optional[M.Route]) -> str:
-    """The label that explains *why* an arrow exists."""
+    """The route that explains why an arrow exists.
+
+    Section 6: show the route, not the target. The arrow already points at the
+    target node, so repeating "NAT Gateway" in the label is noise. ``local`` is
+    kept because it names the mechanism (the VPC local route) rather than a node.
+    """
     if route is None:
         return "no matching route"
-    kind = target_kind(route)
-    if kind == "local":
+    if target_kind(route) == "local":
         return f"{route.destination} local"
-    phrase = TARGET_PHRASE.get(kind)
-    if phrase:
-        return f"{route.destination} \u2192 {phrase}"
-    return f"{route.destination} \u2192 {route.target_id or 'blackhole'}"
+    return route.destination
 
 
 # ---------------------------------------------------------------------------
@@ -282,29 +289,59 @@ def build_flow_model(topo: Topology) -> FlowModel:
 
 
 def _add_external(model: FlowModel) -> None:
-    """External networks and VPC-scoped gateways that sit outside subnets."""
+    """External networks and the gateways that sit outside any subnet.
+
+    Section 7: the diagram shows the logical journey, so every edge here is drawn
+    once, in the direction traffic travels. A blanket INTERNET <-> IGW pair per
+    gateway would be redundant *and* wrong -- the real inbound path is INTERNET ->
+    IGW -> public subnet, and the real outbound path is subnet -> NAT -> IGW ->
+    INTERNET, both of which are drawn from the subnets that actually have those
+    routes.
+    """
     topo = model.topo
 
+    # An IGW is only reachable from the internet if a public subnet fronts it, and
+    # only sends traffic out if something in the VPC egresses through it.
     for igw in topo.igws.values():
         node = nid("igw", igw.id)
-        model.edge(internet_node(), node, "inbound", kind="wan")
-        model.edge(node, internet_node(), "egress", kind="wan")
+        vpc_subnets = [x for x in topo.subnets.values() if x.vpc_id == igw.vpc_id]
+        public_here = [
+            x for x in vpc_subnets
+            if model.routing_for(x.id).classification == PUBLIC
+        ]
+        if public_here:
+            model.edge(
+                internet_node(), node,
+                f"inbound to {igw.vpc_id}", kind="wan",
+            )
+        egress = any(
+            target_kind(r) == "nat"
+            for x in vpc_subnets
+            for r in (topo.rtb_for_subnet(x.id).routes if topo.rtb_for_subnet(x.id) else [])
+        )
+        if egress:
+            model.edge(node, internet_node(), "egress", kind="wan")
 
     # A VPN gateway reaches on-premises, not the internet. Only a VPN connection
-    # whose routes include 0.0.0.0/0 actually carries internet-bound traffic, so
-    # the internet leg is drawn for that case alone rather than for every VGW.
+    # whose routes include 0.0.0.0/0 actually carries internet-bound traffic.
     for vgw in topo.vpn_gateways.values():
         node = nid("vgw", vgw.id)
         conns = [c for c in topo.vpn_connections.values() if c.vgw_id == vgw.id]
         tunnel = "Direct Connect" if _is_direct_connect(vgw.vpn_type) else "IPsec tunnel"
-        model.edge(onprem_node(), node, tunnel, kind="wan")
+        # The subnet -> gateway -> on-premises leg continues from _add_subnet_egress.
         model.edge(node, onprem_node(), tunnel, kind="wan")
         if not conns and not vgw.vpc_id:
             model.note(node, f"not attached to any VPC · {vgw.id}")
         for conn in conns:
-            model.note(node, f"{conn.vpn_type or 'ipsec.1'} → {conn.customer_gw_id or 'customer gateway'}")
+            model.note(
+                node,
+                f"{conn.vpn_type or 'ipsec.1'} → {conn.customer_gw_id or 'customer gateway'}",
+            )
             if any(r.strip() in ("0.0.0.0/0", "::/0") for r in (conn.routes or [])):
-                model.edge(node, internet_node(), "0.0.0.0/0 → on-premises network", kind="wan")
+                model.edge(
+                    node, internet_node(),
+                    "0.0.0.0/0 via on-premises network", kind="wan",
+                )
 
     if topo.vpn_gateways or topo.vpn_connections:
         model.note(onprem_node(), "customer gateway / on-premises")
@@ -316,14 +353,16 @@ def _add_external(model: FlowModel) -> None:
         node = nid("tgw", tgw.id)
         types = {a.resource_type for a in (tgw.attachments or [])}
         if "dx-gateway" in types:
-            model.edge(onprem_node(), node, "Direct Connect", kind="wan")
             model.edge(node, onprem_node(), "Direct Connect", kind="wan")
         if "vpn" in types:
-            model.edge(onprem_node(), node, "IPsec tunnel", kind="wan")
             model.edge(node, onprem_node(), "IPsec tunnel", kind="wan")
         if _tgw_carries_internet(tgw):
             model.edge(node, internet_node(), "0.0.0.0/0", kind="wan")
-        model.note(node, f"{len(tgw.attachments or [])} attachment(s) · {len(tgw.route_tables or [])} route table(s)")
+        model.note(
+            node,
+            f"{len(tgw.attachments or [])} attachment(s) · "
+            f"{len(tgw.route_tables or [])} route table(s)",
+        )
 
 
 def _is_direct_connect(vpn_type: str) -> bool:
@@ -370,15 +409,11 @@ def _add_subnet_egress(model: FlowModel) -> None:
                 nat_node = nid("nat", route.target_id)
                 model.edge(source, nat_node, label, kind="route")
                 if nat is not None:
-                    host = topo.subnets.get(nat.subnet_id or "")
                     # The NAT's subnet can be absent from the inventory (failed
-                    # collection, or a cross-account reference), so never assume it.
-                    if host is not None:
-                        model.note(
-                            nat_node,
-                            f"{host.az or 'unknown AZ'} / {host.cidr or 'no CIDR'}",
-                        )
-                    else:
+                    # collection, or a cross-account reference), so never assume
+                    # it. When it *is* present the node already prints the
+                    # location, so only the anomaly is worth a note.
+                    if topo.subnets.get(nat.subnet_id or "") is None:
                         model.note(
                             nat_node, f"subnet {nat.subnet_id} not found in inventory"
                         )
@@ -450,11 +485,12 @@ def _add_tgw(model: FlowModel) -> None:
                     if kind not in ("local", "igw", "nat"):
                         continue
 
-                    label = f"{tgw_route.destination} from TGW\nvia {vpc_rtb.label}"
-                    if kind == "local":
-                        label += f"\n{next_hop.destination} local"
-                    else:
-                        label += f"\n{next_hop.destination} \u2192 {TARGET_PHRASE.get(kind, kind)}"
+                    # Route-only: the arrow points at the subnet, so naming the
+                    # next hop in the label would just repeat the arrow.
+                    label = (
+                        f"{tgw_route.destination} from TGW\nvia {vpc_rtb.label}"
+                        f"\n{route_label(next_hop)}"
+                    )
 
                     model.edge(tgw_node, sid(subnet.id), label, kind="transit")
                     reached += 1
@@ -469,9 +505,15 @@ def _add_ingress_endpoints(model: FlowModel, topo: Topology, subnet: M.Subnet) -
     """Complete the inbound chain: internet -> IGW -> subnet -> what answers there.
 
     An internet-facing load balancer in a public subnet is where inbound traffic
-    actually terminates, so the arrow continues into it. The port comes from that
-    load balancer's own security group, which is the only listener information
-    the collected API surface provides.
+    actually terminates, so the arrow continues into it. The ports come from that
+    load balancer's own security group, which is the only listener information the
+    collected API surface provides.
+
+    The security status is stated here too: matching a TCP ingress rule on the
+    load balancer's SG *is* an evaluation, so the arrow says "allowed". When no
+    rule could be read it says "unknown" rather than staying silent -- an absent
+    label would read as "no opinion needed", which is how a blocked listener
+    gets mistaken for a working one.
     """
     for wl in topo.workloads_by_subnet.get(subnet.id, []):
         if wl.kind not in ("alb", "nlb", "gwlb", "lb"):
@@ -488,8 +530,16 @@ def _add_ingress_endpoints(model: FlowModel, topo: Topology, subnet: M.Subnet) -
                     continue
                 if rule.from_port > 0:
                     ports.append(rule.from_port)
-        shown = ", ".join(f":{p}" for p in sorted(set(ports))[:3]) or "ingress"
-        model.edge(sid(subnet.id), wid(wl.id), f"terminates here {shown}", kind="target")
+        if ports:
+            shown = ", ".join(f":{p}" for p in sorted(set(ports))[:3])
+            status = SG_ALLOWED
+        else:
+            shown = "ingress"
+            status = SG_UNKNOWN
+        model.edge(
+            sid(subnet.id), wid(wl.id),
+            f"terminates here {shown}\nsecurity: {status}", kind="target",
+        )
 
 
 def _more_specific(candidate: M.Route, current: M.Route) -> bool:
@@ -585,15 +635,110 @@ def _add_endpoints(model: FlowModel) -> None:
 
 
 def _sg_suffix(verdict: str) -> str:
-    if verdict == BLOCKED:
-        return "\nSG DENIES"
-    if verdict == CONDITIONAL:
-        return "\nSG conditional"
-    return ""
+    """Always state the security status on a path.
+
+    Omitting it when the answer is "allowed" makes an unevaluated rule look
+    identical to a permitted one, which is the exact confusion section 16 warns
+    about. Three states only: allowed, blocked, unknown.
+    """
+    return f"\nsecurity: {security_status(verdict)}"
+
+
+class ResolvedTarget:
+    """Where one registered target group target actually lands.
+
+    ``node`` is the flow node id to point at, or None when the target resolves
+    to no addressable resource (a Lambda target, or an IP we cannot place).
+    """
+    node: Optional[str] = None
+    eni: Optional[M.Eni] = None
+    workload: Optional[M.Workload] = None
+    ip: str = ""
+    note: str = ""
+
+
+def _resolve_target(topo: Topology, target: Dict[str, Any]) -> ResolvedTarget:
+    """Resolve one target group registration to a node.
+
+    The registration is the authoritative relationship. Nothing here infers
+    reachability from co-location: a target is drawn because it is registered,
+    not because it shares a VPC, subnet, route table or security group.
+    """
+    out = ResolvedTarget()
+    target_id = str(target.get("id") or "")
+    if not target_id:
+        out.note = "no target id"
+        return out
+    kind = (target.get("type") or "instance").lower()
+
+    if kind == "instance":
+        eni = topo.enis.get(target_id) or _eni_for_instance(topo, target_id)
+        wl = topo.workloads.get(target_id)
+        if wl is None and eni is not None and eni.workload_id:
+            wl = topo.workloads.get(eni.workload_id)
+        if eni is None:
+            out.note = f"instance {target_id} has no collected ENI"
+            return out
+        out.eni, out.workload, out.ip = eni, wl, eni.private_ip
+        out.node = wid(wl.id) if wl is not None else wid(target_id)
+        return out
+
+    if kind in ("ip", "instance-ip"):
+        # An IP target is just an address; find the interface that holds it.
+        eni = topo.enis_by_ip.get(target_id)
+        if eni is None:
+            out.ip = target_id
+            out.node = f"ip_{target_id.replace('.', '_').replace(':', '_')}"
+            out.note = "IP target with no matching ENI"
+            return out
+        out.eni, out.ip = eni, eni.private_ip
+        out.workload = topo.workloads.get(eni.workload_id) if eni.workload_id else None
+        out.node = (
+            wid(out.workload.id)
+            if out.workload is not None
+            else f"ip_{target_id.replace('.', '_')}"
+        )
+        return out
+
+    if kind == "ecs":
+        # The target id is "container:port"; the service owns the task ENIs.
+        name = target_id.split(":", 1)[0]
+        for wl in topo.workloads.values():
+            if wl.kind == "ecs-service" and wl.name == name:
+                out.workload = wl
+                out.node = wid(wl.id)
+                out.ip = (wl.extra.get("task_ips") or [""])[0]
+                out.eni = _eni_for_instance(topo, out.ip) if out.ip else None
+                if out.eni is None:
+                    for e in topo.enis.values():
+                        if e.private_ip == out.ip:
+                            out.eni = e
+                            break
+                if not wl.extra.get("running_tasks"):
+                    out.note = "no running tasks"
+                return out
+        out.note = f"ECS service {name} not collected"
+        return out
+
+    if kind == "lambda":
+        wl = topo.workloads.get(target_id)
+        out.workload = wl
+        out.node = wid(wl.id) if wl is not None else wid(target_id)
+        out.note = "Lambda target has no ENI; no route is drawn"
+        return out
+
+    out.note = f"unsupported target type {kind!r}"
+    return out
 
 
 def _add_workload_paths(model: FlowModel) -> None:
-    """The 'story' arrows: load balancer -> target, and compute tier -> data tier."""
+    """The 'story' arrows: load balancer -> registered target, and tier paths.
+
+    Every arrow here originates from a real target group registration. The
+    listener supplies the client-facing port and protocol; the label carries the
+    target group by name so the relationship is legible without a target group
+    node of its own.
+    """
     topo = model.topo
     engine = PathEngine(topo)
 
@@ -604,40 +749,77 @@ def _add_workload_paths(model: FlowModel) -> None:
         if src_eni is None:
             continue
         for target in (wl.extra.get("targets") or [])[:MAX_TARGETS_PER_LB]:
-            self_dst = target.get("id") or ""
-            if not self_dst:
-                continue
-            dst_eni = topo.enis.get(self_dst) or _eni_for_instance(topo, self_dst)
-            tgt = topo.workloads.get(self_dst)
-            if dst_eni is None:
-                continue
-            dst_subnet = topo.subnets.get(dst_eni.subnet_id)
-            if dst_subnet is None:
+            resolved = _resolve_target(topo, target)
+            if resolved.note:
+                model.note(wid(wl.id), f"target {target.get('id', '?')}: {resolved.note}")
+            if resolved.node is None:
                 continue
 
-            port_raw = target.get("port") or ""
-            port = int(port_raw) if str(port_raw).isdigit() else None
-            res = engine.resolve(
-                src_eni.private_ip,
-                src_eni.subnet_id,
-                dst_eni.private_ip,
-                dst_vpc_id=dst_subnet.vpc_id,
-                dst_subnet_id=dst_subnet.id,
-                dst_sg_ids=tgt.sg_ids if tgt is not None else [],
-                port=port,
-                with_reverse=False,
-            )
-            label = f"TCP :{port_raw}" if port_raw else "target group"
-            label += f"\nvia {route_label(res.route)}{_sg_suffix(res.sg_verdict)}"
-            _tally(model, res.sg_verdict)
-            model.edge(
-                wid(wl.id),
-                wid(tgt.id if tgt is not None else self_dst),
-                label,
-                kind="target",
-            )
+            listeners = target.get("listeners") or []
+            front = _primary_listener(listeners)
+            port_txt = f":{front['port']}" if front and front.get("port") else ""
+            proto = front.get("protocol") if front else ""
+            front_label = f"{proto}{port_txt}".strip() if front else ""
+            others = [
+                f"{l.get('protocol')}{':' + str(l.get('port')) if l.get('port') else ''}"
+                for l in listeners
+                if l is not front
+            ]
+            if others:
+                model.note(wid(wl.id), f"also forwards {', '.join(others)}")
+            tg_name = target.get("target_group") or ""
+
+            res = None
+            if src_eni.private_ip and resolved.ip:
+                res = engine.resolve(
+                    src_eni.private_ip,
+                    src_eni.subnet_id,
+                    resolved.ip,
+                    dst_vpc_id=resolved.eni.vpc_id if resolved.eni else "",
+                    dst_subnet_id=resolved.eni.subnet_id if resolved.eni else "",
+                    dst_sg_ids=resolved.workload.sg_ids if resolved.workload else [],
+                    port=_int_or(target.get("port"), None),
+                    with_reverse=False,
+                )
+
+            label = front_label or (f"TCP :{target['port']}" if target.get("port") else "")
+            if tg_name:
+                label = f"{label}\nTG: {tg_name}" if label else f"TG: {tg_name}"
+            if res is not None:
+                label += f"\n{route_label(res.route)}"
+                label += _sg_suffix(res.sg_verdict)
+                _tally(model, res.sg_verdict)
+            model.edge(wid(wl.id), resolved.node, label, kind="target")
 
     _add_tier_paths(model, engine)
+
+
+TLS_PROTOCOLS = ("HTTPS", "TLS", "TCP_TLS", "SSL", "TCP-SSL")
+
+
+def _primary_listener(listeners: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pick the listener that represents the load balancer's real entry point.
+
+    An internet-facing ALB normally has both :80 and :443 forwarding to the same
+    group. Alphabetical order would pick HTTP, which is the wrong one to headline.
+    Prefer a TLS listener, then the highest port, then the lowest.
+    """
+    if not listeners:
+        return None
+
+    def key(ln: Dict[str, Any]):
+        proto = str(ln.get("protocol") or "")
+        secure = 0 if proto.upper() in TLS_PROTOCOLS else 1
+        return (secure, -_int_or(ln.get("port"), 0))
+
+    return sorted(listeners, key=key)[0]
+
+
+def _int_or(value: Any, fallback: Any) -> Any:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _eni_for_instance(topo: Topology, instance_id: str) -> Optional[M.Eni]:
@@ -679,15 +861,17 @@ def _add_tier_paths(model: FlowModel, engine: PathEngine) -> None:
             )
             if res.route is None:
                 continue
-            label = f"TCP :{port}\nvia {route_label(res.route)}{_sg_suffix(res.sg_verdict)}"
+            label = f"TCP :{port}\n{route_label(res.route)}{_sg_suffix(res.sg_verdict)}"
             _tally(model, res.sg_verdict)
             model.edge(wid(src.id), wid(dst.id), label, kind="target")
 
 
 def _tally(model: FlowModel, verdict: str) -> None:
-    if verdict == BLOCKED:
+    """Count paths by security status so the summary can report all three."""
+    status = security_status(verdict)
+    if status == SG_BLOCKED:
         model.blocked += 1
-    elif verdict == CONDITIONAL:
+    elif status == SG_UNKNOWN:
         model.conditional += 1
     else:
         model.traced += 1
