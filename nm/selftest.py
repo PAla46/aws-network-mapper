@@ -880,6 +880,98 @@ def run_self_test(verbose: bool = True) -> int:
             "%% ---- how to read this ----" in m_a)
 
     # ------------------------------------------------- incomplete inventory
+    # ------------------------------------------------- ELBv2 target types
+    print("\n[6c/8] every ELBv2 target type resolves to a real node")
+
+    # The demo only registers `instance` targets, so the ip / ecs / lambda
+    # resolution paths were untested code. Each gets its own target group here,
+    # and each listener points at exactly one of them.
+    tgt_dict = build_fixtures()
+    us = tgt_dict["us-east-1"]
+    alb2 = ("arn:aws:elasticloadbalancing:us-east-1:111122223333:"
+            "loadbalancer/app/shared-alb/aaaa111")
+    groups, listeners, health = [], [], {}
+    specs = [
+        ("tg-ip", "ip", "172.16.1.20"),     # the Lambda ENI's private address
+        ("tg-ecs", "ecs", "ingest:8080"),  # container:port
+        ("tg-lambda", "lambda",
+         "arn:aws:lambda:us-east-1:111122223333:function:ingest-handler"),
+    ]
+    for name, ttype, target_id in specs:
+        suffix = "a" * 6
+        arn = (f"arn:aws:elasticloadbalancing:us-east-1:111122223333:"
+               f"targetgroup/{name}/{suffix}")
+        groups.append({
+            "TargetGroupName": name, "TargetGroupArn": arn,
+            "LoadBalancerArns": [alb2], "TargetType": ttype,
+        })
+        listeners.append({
+            "ListenerArn": f"{arn}/l1", "LoadBalancerArn": alb2,
+            "Port": 8443, "Protocol": "HTTPS",
+            "DefaultTargetGroups": [{"TargetGroupArn": arn}],
+        })
+        health[f"elbv2.target_health:{name}/{suffix}"] = [{
+            "Target": {"Id": target_id, "Port": 8080,
+                       "AvailabilityZone": "us-east-1a"},
+            "TargetHealth": {"State": "healthy"},
+        }]
+    us["elbv2.describe_target_groups"] = groups
+    us[f"elbv2.listeners:{'/'.join(alb2.split('/')[-2:])}"] = listeners
+    us.update(health)
+    # The load balancer needs an interface of its own; eni-shared-01 belongs to
+    # the Lambda function.
+    us["describe_network_interfaces"] = list(us["describe_network_interfaces"]) + [{
+        "NetworkInterfaceId": "eni-alb-shared",
+        "SubnetId": "subnet-shared-1", "VpcId": "vpc-shared",
+        "PrivateIpAddress": "172.16.1.30", "SourceDestCheck": True,
+        "InterfaceType": "network_load_balancer",
+        "Description": "ELB app/shared-alb/aaaa111",
+        "Groups": [{"GroupId": "sg-shared", "GroupName": "sg-shared"}],
+    }]
+    us["elbv2.describe_load_balancers"] = [{
+        "LoadBalancerArn": alb2, "LoadBalancerName": "shared-alb",
+        "Type": "application", "Scheme": "internal", "DNSName": "internal",
+        "AvailabilityZones": [
+            {"SubnetId": "subnet-shared-1", "NetworkInterfaceId": "eni-alb-shared"}
+        ],
+        "SecurityGroups": ["sg-shared"],
+    }]
+    col_t = FixtureCollector(
+        tgt_dict, cache_dir=None,
+        services=("ec2-workloads", "elbv2", "rds", "ecs", "eks", "lambda"),
+        pool_factory=lambda region: FakePool(region),
+    )
+    col_t.start()
+    try:
+        topo_t = Topology([col_t.collect_region(r) for r in tgt_dict])
+        m_t = flow.build_flow_model(topo_t)
+        src = flow.wid("aaaa111")
+        arrows = [e for e in m_t.edges if e.src == src]
+        kinds = {k: {flow.wid(w.id) for w in topo_t.workloads.values() if w.kind == k}
+                 for k in ("lambda", "ecs-service")}
+        reached = {e.dst for e in arrows}
+        c.check("an ip target resolves to the interface holding that address",
+                reached & kinds["lambda"] == kinds["lambda"],
+                f"arrows={sorted(reached)} lambda={sorted(kinds['lambda'])}")
+        c.check("an ecs target resolves to the service node",
+                reached & kinds["ecs-service"] == kinds["ecs-service"],
+                f"arrows={sorted(reached)} ecs={sorted(kinds['ecs-service'])}")
+        c.check("all three target types produced an arrow",
+                len(arrows) == len(specs),
+                f"{len(arrows)} arrow(s) for {len(specs)} target group(s)")
+        c.check("every target arrow names its target group and listener",
+                all("TG: tg-" in e.label and "HTTPS:8443" in e.label for e in arrows),
+                str([e.label.replace(chr(10), " / ") for e in arrows]))
+        c.check("a resolved target carries a route and a security verdict",
+                all("security: " in e.label for e in arrows),
+                str([e.label.replace(chr(10), " / ") for e in arrows]))
+        # The Lambda ENI must fold into the function node, not appear twice.
+        t_t = mermaid.render_topology(topo_t, m_t)
+        c.check("a Lambda VPC ENI is folded into the function node",
+                t_t.count("172.16.1.20") == 1, t_t.count("172.16.1.20"))
+    except Exception as exc:  # noqa: BLE001
+        c.check("every ELBv2 target type resolves", False, repr(exc))
+
     print("\n[6d/8] incomplete inventory does not break the diagram")
 
     # The shape that produced a hard crash in the field: a NAT gateway whose own

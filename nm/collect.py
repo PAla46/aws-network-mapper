@@ -1073,7 +1073,9 @@ class Collector:
             if vpc_cfg.get("VpcId"):
                 snap.workloads.append(
                     M.Workload(
-                        id=fn.get("FunctionName", ""),
+                        # The ARN is the globally unique handle; a function name
+                        # is only unique per region, and this tool merges regions.
+                        id=fn.get("FunctionArn") or fn.get("FunctionName", ""),
                         kind="lambda",
                         region=region,
                         vpc_id=vpc_cfg.get("VpcId", ""),
@@ -1159,6 +1161,30 @@ class Collector:
                 eni.workload_name = wl.label
                 continue
             eni.workload_kind, eni.workload_id, eni.workload_name = infer_eni_owner(eni, snap)
+            if eni.workload_kind == "lambda" and eni.workload_id:
+                owner = by_eni.get(eni.workload_id) or next(
+                    (w for w in snap.workloads if w.id == eni.workload_id), None
+                )
+                if owner is not None and eni.id not in (owner.eni_ids or []):
+                    owner.eni_ids = list(owner.eni_ids or []) + [eni.id]
+
+
+def _match_lambda_eni(eni: M.Eni, snap: AccountSnapshot) -> Optional[M.Workload]:
+    """Find the Lambda function a VPC ENI belongs to.
+
+    Lambda ENIs carry no attachment record, so the only signals are the subnet
+    the ENI sits in and the security groups on it. A match has to be
+    unambiguous: with two functions in one subnet there is nothing to choose
+    between them, and guessing would put the ENI on the wrong node.
+    """
+    candidates = [
+        wl
+        for wl in snap.workloads
+        if wl.kind == "lambda"
+        and eni.subnet_id in (wl.subnet_ids or [])
+        and (set(wl.sg_ids or []) & set(eni.sg_ids or []))
+    ]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def infer_eni_owner(eni: M.Eni, snap: AccountSnapshot) -> Tuple[str, str, str]:
@@ -1186,7 +1212,10 @@ def infer_eni_owner(eni: M.Eni, snap: AccountSnapshot) -> Tuple[str, str, str]:
             }[kind]
             if desc_kind in desc:
                 return kind, eni.id, eni.id
-    if "lambda" in desc:
+    if "lambda" in desc or iface == "lambda":
+        wl = _match_lambda_eni(eni, snap)
+        if wl is not None:
+            return wl.kind, wl.id, wl.label
         return "lambda-eni", eni.id, eni.id
     if "vpce" in desc or iface in ("vpce", "endpoint"):
         ep = next(

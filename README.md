@@ -1,75 +1,135 @@
 # aws-network-mapper
 
-Read-only AWS network and route topology mapper. It collects VPCs, subnets, route
-tables and the resources attached to them, then draws how it all connects: which
-route tables exist, where the internet gateway goes, what hangs off the transit
-gateway, and what can reach what.
+Read-only AWS network mapper. It collects VPCs, subnets, route tables, gateways
+and the resources attached to them, then answers one question in a single picture:
 
-Output is Mermaid diagrams by default. Pass `--reports` if you also want CSV and
-Markdown evidence.
+> For this path — source, entry point, VPC, subnet, route, next hop, destination —
+> what does the configuration actually permit, and what does security allow?
 
-It only calls `Describe*` and `List*` APIs. It never creates, modifies or deletes
-anything.
+It only calls `Describe*` and `List*` APIs. It never creates, modifies or
+deletes anything.
+
+```bash
+python3 aws_network_mapper.py --all-regions --out ./network-map
+```
+
+Then paste `./network-map/00-network-topology.mmd` into
+<https://mermaid.live>.
+
+No AWS account handy?
+
+```bash
+python3 aws_network_mapper.py --self-test     # 215 offline checks, no AWS calls
+python3 aws_network_mapper.py --demo --out ./demo
+```
+
+---
+
+## Contents
+
+- [What it produces](#what-it-produces)
+- [The diagram](#the-diagram)
+  - [Containers are location, arrows are traffic](#containers-are-location-arrows-are-traffic)
+  - [Arrow labels](#arrow-labels)
+  - [One arrow per journey](#one-arrow-per-journey)
+  - [Security status](#security-status)
+  - [What is deliberately not a node](#what-is-deliberately-not-a-node)
+  - [Large accounts](#large-accounts)
+- [How a path is derived](#how-a-path-is-derived)
+  - [Subnet classification comes from routing](#subnet-classification-comes-from-routing)
+  - [Longest-prefix match](#longest-prefix-match)
+  - [Gateway next hops](#gateway-next-hops)
+  - [Workload targets](#workload-targets)
+  - [No invented connectivity](#no-invented-connectivity)
+  - [Configured is not observed](#configured-is-not-observed)
+- [A worked example](#a-worked-example)
+- [CLI reference](#cli-reference)
+- [Permissions](#permissions)
+- [Rules](#rules)
+- [Reports](#reports)
+- [Design notes](#design-notes)
+- [Limitations](#limitations)
+
+---
 
 ## What it produces
 
-Default output is **one diagram**, plus an index:
+Default output is **one diagram** and a short index. Nothing else:
 
 ```
 <out>/
-  START-HERE.md          how to read the diagram, plus every finding in a table
-  00-network-topology.mmd  THE diagram: the whole account, one picture
-  logs/run.log
+  00-network-topology.mmd   THE diagram: the whole account, one picture
+  START-HERE.md             how to read it, plus every finding in a table
+  logs/run.log              collection log, including any denied API call
+  .cache/                   raw API responses, for offline rebuilds
 ```
 
 There is deliberately no second diagram. No separate network / security view, no
-separate routing / resource view, no simplified and detailed pair, and nothing
+separate routing / resource view, no simplified-and-detailed pair, and nothing
 per VPC, per AZ or per subnet. Location and traffic paths share one picture
-because splitting them is what made the old output read like an inventory.
+because splitting them is what made the previous output read like an inventory.
 
-Add `--reports` for the CSV/Markdown evidence set:
+Add `--reports` for the CSV and Markdown evidence set:
 
 ```
-  report.md                  summary
-  findings/findings.md       findings grouped by severity
-  findings/findings.csv      same findings, one row each
-  reports/routes.csv         every route, normalised
-  reports/subnets.csv        reports/resources.csv        reports/security-groups.csv
-  reports/network-interfaces.csv
-  reports/cross-vpc-connectivity.csv     reports/load-balancer-flows.csv
-  reports/internet-exposure.csv          reports/cidr-map.csv
-  inventory.json             full normalized snapshot
-  .cache/                    raw API responses, for offline rebuilds
+  report.md                        narrative summary
+  inventory.json                   full normalized snapshot
+  findings/findings.md             findings grouped by severity
+  findings/findings.csv            same findings, one row each
+  reports/routes.csv               every route, normalised
+  reports/subnets.csv              reports/resources.csv
+  reports/security-groups.csv      reports/network-interfaces.csv
+  reports/cross-vpc-connectivity.csv
+  reports/load-balancer-flows.csv  reports/internet-exposure.csv
+  reports/cidr-map.csv
 ```
 
-The diagram is Mermaid text. Paste it into <https://mermaid.live>.
+---
 
-## The topology diagram
+## The diagram
 
-`00-network-topology.mdd` is the point of the tool. It answers, in one picture:
-where things live, how traffic leaves them, which route is used, what the next
-hop is, and where the traffic ends up.
+`00-network-topology.mmd` is the point of the tool.
 
-The file is **pure architecture**: containers, nodes and arrows, nothing else. No
-totals, no summary box, no report text. Counts are printed to the console
-instead, so the picture never competes with its own statistics. The `.mmd` does
-carry `%%` comment lines explaining how to read it — those render as nothing.
+It is **pure architecture**: containers, nodes and arrows. No totals, no summary
+box, no report text — a picture that argues with its own statistics is worse than
+no picture. The counts are printed to the console instead:
 
-### Two visual languages, never mixed
+```
+  topology: 6 VPC(s), 14 subnet(s) (6 public / 3 private / 5 isolated)
+  paths drawn: 44 network path(s); workload paths 5 allowed / 0 blocked / 0 unknown
+```
 
-**Containers are location.** They nest:
+The `.mmd` file does carry `%%` comment lines explaining how to read it. Those
+are Mermaid comments: they render as nothing at all, and they are what makes a
+pasted diagram self-explanatory.
+
+### Containers are location, arrows are traffic
+
+Two visual languages, never mixed.
+
+**Containers are where things live.** They nest:
 
 ```
 AWS Account > VPC > Availability Zone > Subnet > resources
 ```
 
-A subnet container tells you *where* a resource lives. Each subnet header also
-carries its id, CIDR, AZ, associated route table, NACL, and classification.
+Each subnet header carries its id, CIDR, AZ, associated route table, NACL, and
+routing-derived classification:
 
-**Arrows are traffic paths.** Every arrow is labelled with the route that
-justifies it, so you can look at any line and know why it exists. The label names
-the *route*, never the node it points at — the arrowhead already says where it
-goes:
+```
+subnet-pub-1  ·  10.0.1.0/24  ·  AZ eu-west-1a
+Route table: public-tier (rtb-prod-public)
+NACL: acl-prod-default  ·  2 in / 0 out
+Type: PUBLIC — 0.0.0.0/0 → Internet Gateway
+```
+
+**Arrows are traffic paths.** Every arrow exists because real configuration
+supports it, and carries the label that justifies it.
+
+### Arrow labels
+
+A label names the **route**, never the node it points at. The arrowhead already
+says where the arrow goes, so repeating the destination is noise:
 
 ```
 0.0.0.0/0
@@ -77,16 +137,37 @@ goes:
 172.16.0.0/16
 10.0.0.0/16 local
 TCP :5432
+HTTPS:443 / TG: app-tg / 10.0.0.0/16 local / security: allowed
 ```
 
-Each journey is drawn **once, in the direction traffic travels**. Inbound is
-`INTERNET → IGW → public subnet → ALB`; outbound is
-`private subnet → NAT → IGW → INTERNET`. A mirrored pair of arrows is not drawn
-just because the reverse is also possible.
+`local` is the one word that names a mechanism rather than a node, and it is
+correct: intra-VPC routing is not a gateway.
+
+A load balancer arrow uses the **listener** port and protocol — the port a client
+actually connects to — and names the target group as metadata, because traffic is
+delivered to the targets, not to the group:
+
+```
+ALB my-alb  ──HTTPS:443 / TG: app-tg──▶  EC2 app-01
+```
+
+### One arrow per journey
+
+Each path is drawn **once, in the direction traffic travels**:
+
+```
+inbound    INTERNET → IGW → public subnet → ALB
+outbound   private subnet → NAT → IGW → INTERNET
+peering    subnet → VPC peering → subnet
+transit    subnet → TGW → subnet
+```
+
+A reverse arrow appears only when routing genuinely supports it. Nothing is
+mirrored for the sake of a tidy picture.
 
 ### Security status
 
-Every path edge states its security status, so "the route exists" is never
+Every path edge states its security verdict, so "the route exists" is never
 mistaken for "the traffic gets through":
 
 ```
@@ -95,81 +176,71 @@ security: blocked
 security: unknown
 ```
 
-`unknown` means the rules could not be fully evaluated — a missing permission, or
-an ENI whose security groups were not collected. It is deliberately not the same
-as `allowed`, and never folded into `blocked`.
+- `blocked` — a security group rule was evaluated and refuses the flow. The route
+  is still a route; the block is never drawn as a fake hop, and the arrow stays.
+- `unknown` — the rules could not be fully evaluated: a missing permission, or an
+  ENI whose security groups were not collected. This is deliberately **not** the
+  same as `allowed`, and is never folded into `blocked`.
+- `allowed` — every relevant egress and ingress rule was evaluated and permits it.
 
-### Reading a path
+An unevaluated rule must never be indistinguishable from a permitted one, which
+is why the field is always present rather than only shown when it is negative.
 
-```
-INTERNET
-  |  inbound to vpc-prod
-  v
-Internet Gateway  --(inbound to 10.0.1.0/24)-->
-  v
-PUBLIC SUBNET 10.0.1.0/24          <- where the ALB lives
-  |
-  |  terminates here :443   security: allowed
-  v
-ALB
-  |  HTTPS:443 / TG: app-tg / 10.0.0.0/16 local / security: allowed
-  v
-PRIVATE SUBNET 10.0.10.0/24        <- where the app server lives
-  |
-  |  TCP :5432   10.0.0.0/16 local   security: allowed
-  v
-RDS PostgreSQL
-```
+### What is deliberately not a node
 
-And independently, the egress story for the same private subnet:
-
-```
-EC2
-  v
-PRIVATE SUBNET
-  |  0.0.0.0/0
-  v
-NAT Gateway (public, in subnet-pub-1 · 10.0.1.0/24 · eu-west-1a)
-  |  via public subnet
-  v
-Internet Gateway
-  |  egress
-  v
-INTERNET
-```
-
-A **target group is not a node**: it is metadata on the arrow that uses it, since
-traffic is delivered to the instances, not to the group. An ALB arrow is only
-drawn when the target group has a real registration for that target — an empty
-target group produces no arrow rather than a hopeful one.
-
-### What is deliberately *not* a node
-
-The old diagram drew generic association arrows such as `Subnet --filtered by-->
-NACL`. Traffic does not travel through a NACL or a security group, so those are
-not nodes here:
+Traffic does not travel through a NACL or a security group, so neither is a node:
 
 | Concept | Role | Where it appears |
 | --- | --- | --- |
-| Subnet | where the resource lives | container, with id/CIDR/AZ/route table/NACL |
-| Route table | where traffic goes next | on the subnet header, and as the label on each arrow |
+| Subnet | where the resource lives | container, with id / CIDR / AZ / route table / NACL |
+| Route table | where traffic goes next | subnet header, and the label on each arrow |
 | IGW / NAT / TGW / peering / VPCE | how networks connect | nodes on the traffic path |
 | VPN gateway | how a VPC reaches on-premises | node, joined to ON-PREMISES |
-| NACL | subnet-level filtering | `NACL: acl-...  4 in / 2 out` in the subnet header |
-| Security group | ENI-level filtering | `SG: sg-...` plus inbound rules in the resource node |
+| NACL | subnet-boundary filtering | `NACL: acl-...  ·  2 in / 0 out` in the subnet header |
+| Security group | ENI-level filtering | `SG: sg-...` in the resource node, plus the edge verdict |
+| Target group | names a set of targets | metadata on the arrow that uses it |
+| Network interface | belongs to a resource | folded into the resource that owns it |
 | Resource | where traffic terminates | node inside its subnet |
 
-`local` is not drawn as a "Local Gateway" either. `10.0.0.0/16 local` is
-intra-VPC routing, so it appears in an *arrow label* and the arrow runs straight
-from the source resource to the destination resource across the subnet
-containers that contain them.
+Two consequences worth stating:
 
-When a diagram hits its size budget, subnet headers and workload detail are shed
-first. **Network components are never shed**: a NAT gateway, IGW, TGW, peering,
-VPN gateway or VPC endpoint that an arrow points at is always drawn, even when
-its own subnet could not be. Hiding one would turn "this path exists" into "I
-could not draw this path", which is a different claim. A NAT whose subnet is
-missing from the inventory still appears, annotated with the subnet it expects.
+- **ENIs are folded into their owner.** A Lambda with a VPC attachment does not
+  appear twice, once as `LAMBDA` and once as `NETWORK INTERFACE`.
+- **`local` is never a "Local Gateway" box.** The arrow runs straight from source
+  resource to destination resource, crossing the subnet containers that contain
+  them, labelled `10.0.0.0/16 local`.
+
+A multi-subnet resource is drawn **once** and states its placement
+(`in 2 subnets`), because duplicating the node would imply several load
+balancers. Subnets are grouped into their own AZ container, so multi-AZ
+deployments stay visible.
+
+### Large accounts
+
+`--max-diagram-vpcs` (default 60) and `--max-diagram-subnets` (default 200 per
+VPC) bound the drawing.
+
+When the budget bites, **subnet and workload nodes are shed first**. A dropped
+subnet or workload is replaced by an `OMITTED` placeholder that names the reason,
+so an arrow never silently loses its destination and the file still parses.
+
+Network components are never shed: a NAT gateway, IGW, TGW, peering, VPN gateway
+or VPC endpoint that an arrow points at is always drawn, even when its own subnet
+could not be. Hiding one would turn "this path exists" into "I could not draw
+this path", which is a different claim. A NAT whose subnet is missing from the
+inventory still appears, annotated with the subnet it expects.
+
+Resources that attach to nothing have no place in a topology, so they are
+recorded as `%%` comments at the end of the file rather than silently dropped.
+
+---
+
+## How a path is derived
+
+Discovery is unchanged and independent of the renderer: it collects, normalizes
+into `nm/model.py`, indexes in `nm/topology.py`, and evaluates reachability in
+`nm/paths.py`. The diagram is built *from* those verdicts, never by re-deriving
+routing, so the picture and the `--reports` CSVs cannot disagree.
 
 ### Subnet classification comes from routing
 
@@ -178,149 +249,225 @@ Not from the subnet name. The tool reads the subnet's effective route table:
 | Classification | Derived from |
 | --- | --- |
 | `PUBLIC` | `0.0.0.0/0` targets an Internet Gateway |
-| `PRIVATE` | `0.0.0.0/0` targets a NAT Gateway (or leaves via TGW/VGW) |
+| `PRIVATE` | `0.0.0.0/0` targets a NAT Gateway, or leaves via TGW / VGW |
 | `ISOLATED` | no `0.0.0.0/0` route at all |
 
-Each subnet header states the route that proves its classification, e.g.
+Each header states the route that proves its classification, e.g.
 `Type: ISOLATED — no 0.0.0.0/0 route in its route table`.
 
 ### Longest-prefix match
 
-Route selection follows AWS behaviour: the most specific applicable route wins,
-via `cidrutil.longest_prefix_match`. `nm/paths.py:PathEngine.resolve()` walks the
-route table, resolves the next hop (IGW, NAT, TGW, peering, VGW, VPC endpoint),
-and records the hops. `nm/flow.py` reuses that engine rather than re-deriving
-routing, so the diagram and the `--reports` cross-VPC CSV cannot disagree.
+Route selection follows AWS behaviour: the most specific applicable route wins, via
+`nm/cidrutil.py:longest_prefix_match()`. `nm/paths.py:PathEngine.resolve()` walks
+the route table, resolves the next hop, records the hops, then evaluates security
+groups for the port.
+
+`nm/flow.py` reuses that engine rather than re-deriving routing, so the diagram
+and the cross-VPC CSV are the same computation.
+
+### Gateway next hops
+
+| Next hop | Requires |
+| --- | --- |
+| Internet Gateway | an attached IGW on a subnet with a `0.0.0.0/0` route to it |
+| NAT Gateway | a NAT in the account, resolvable to its own subnet and IGW |
+| Transit Gateway | a TGW route table entry that really delivers into an attached VPC, then resolved further through *that* VPC's own route table |
+| VPC peering | a route table that actually points at the peering, and an active connection |
+| VPN gateway | reached via its VPC; grows an internet leg only when a VPN connection advertises `0.0.0.0/0` |
+| VPC endpoint | an endpoint with ENIs in the subnets that route to it |
+
+Gateways are not given reachability they do not have. A transit gateway grows a
+Direct Connect or IPsec leg only when it has a `dx-gateway` or `vpn` attachment,
+and an internet leg only when a TGW route table really sends `0.0.0.0/0` to one of
+those. A TGW with nothing but VPC attachments has neither.
+
+### Workload targets
+
+Every workload arrow originates from a real target group registration. The
+registration is authoritative: a target is drawn because it is registered, not
+because it shares a VPC, subnet, route table or security group.
+
+The collector resolves the target types that actually appear in ELBv2:
+
+| Target type | Resolved to |
+| --- | --- |
+| `instance` | the instance's ENI, so the correct source subnet and SGs are used |
+| `ip` / `instance-ip` | the interface holding that address |
+| `ecs` | the service, via its task ENIs |
+| `lambda` | the function's VPC ENI, so the path is routable; a function with no ENI in the inventory draws no arrow and says so |
+
+An empty target group produces **no arrow** rather than a hopeful one. When a
+target cannot be resolved, the load balancer node carries a note naming the
+target and the reason.
+
+Registration, not health, is what draws the arrow. A registered target that is
+currently `unhealthy` still gets an arrow, because the diagram reports configured
+reachability — see [Configured is not observed](#configured-is-not-observed).
+Health state is collected from `DescribeTargetHealth` and carried on the target
+record, but it does not gate the arrow.
+
+Other workload kinds attach to the topology through their own configuration:
+
+- **RDS** — via its DB subnet group, then the instance ENI. The ENI is what makes
+  the `EC2 → RDS` arrow traceable, and it is matched from
+  `Attachment.AttachmentId`, the field EC2 actually populates.
+- **ECS** — clusters *and* services are separate nodes, keyed by ARN. Services
+  show their running-task count, resolved through `ListTasks` / `DescribeTasks`.
+  Only `RUNNING` tasks contribute task IPs, so a service with nothing running does
+  not gain an invented endpoint.
+- **EKS** — via `resourcesVpcConfig`; the node shows the Kubernetes version.
+- **Lambda** — via its VPC subnets and security groups. Its ENI is attributed to
+  the function (matching on subnet plus security group, and only when that match
+  is unambiguous) so it folds into the `LAMBDA` node instead of appearing a second
+  time as a bare interface. Functions are keyed by ARN, like every other workload.
 
 ### No invented connectivity
 
-An arrow is only drawn when real configuration supports it:
+An arrow is drawn only when configuration supports it:
 
 - a route in a real route table, resolved by longest-prefix match
-- a registered load balancer target, at its real target-group port
-- a Transit Gateway route table entry that actually delivers into an attached
-  VPC, resolved further through *that* VPC's own route table
+- a registered load balancer target, at its real listener port
+- a TGW route table entry that actually delivers into an attached VPC
 - a VPC peering that some route table actually points at
 
-Gateways are not given reachability they do not have. A VPN gateway is wired to
-ON-PREMISES, not to the internet; it only grows an internet leg when one of its
-VPN connections actually advertises a `0.0.0.0/0` route. A transit gateway only
-grows a Direct Connect or IPsec leg when it has a `dx-gateway` or `vpn`
-attachment, and only grows an internet leg when a TGW route table really sends
-`0.0.0.0/0` to one of those attachments. A TGW with nothing but VPC attachments
-has neither.
+### Configured is not observed
 
-Arrows show **configured reachability**, not observed traffic. The diagram says
-"network path" and "route exists", never "application talks to". If a route
-exists but a security group blocks the port, the arrow stays and gains an
-`SG DENIES` annotation — the route is still a route, and the block is not turned
-into a fake hop.
+Arrows show **configured reachability**, not observed traffic. The tool says
+"network path" and "route exists", never "application talks to". Distinguishing
+configured from used needs telemetry that configuration does not contain: VPC
+Flow Logs, Transit Gateway Flow Logs, or a Network Firewall. `NET018` flags VPCs
+without flow logs for exactly that reason.
 
-### Multi-AZ and multi-subnet resources
+---
 
-Subnets are grouped into their own AZ container, so multi-AZ deployments are
-visible. A load balancer with ENIs in several subnets is drawn once and lists
-its placement, because duplicating the node would imply several load balancers.
+## A worked example
 
-### Large accounts
+Inbound, as drawn for the bundled demo:
 
-`--max-diagram-vpcs` (default 60) and `--max-diagram-subnets` (default 200 per
-VPC) bound the drawing. Security resources that attach to nothing have no place
-in a topology, so they are recorded as `%%` comments at the end of the file
-rather than being silently dropped.
-
-## Running it in CloudShell
-
-CloudShell already has `boto3` and the AWS CLI, and its credentials are
-pre-configured, so no setup is needed:
-
-```bash
-unzip aws-network-mapper.zip
-python3 aws_network_mapper.py --all-regions --deep --out ./network-map
+```
+INTERNET
+  │  inbound to vpc-prod
+  ▼
+Internet Gateway ──(inbound to 10.0.1.0/24)──▶
+  ▼
+PUBLIC SUBNET 10.0.1.0/24            ← the ALB lives here
+  │  terminates here :443   security: allowed
+  ▼
+ALB my-alb
+  │  HTTPS:443 / TG: app-tg / 10.0.0.0/16 local / security: allowed
+  ▼
+PRIVATE SUBNET 10.0.10.0/24          ← the app server lives here
 ```
 
-Start narrower while you are tuning the options:
+And the egress story for that same private subnet, independently:
 
-```bash
-python3 aws_network_mapper.py --regions eu-west-1,us-east-1 --out ./map
+```
+EC2
+  ▼
+PRIVATE SUBNET 10.0.10.0/24
+  │  0.0.0.0/0
+  ▼
+NAT Gateway (public, in subnet-pub-1 · 10.0.1.0/24 · eu-west-1a)
+  │  via public subnet
+  ▼
+Internet Gateway
+  │  egress
+  ▼
+INTERNET
 ```
 
-Then open `./map/START-HERE.md`, which lists every diagram and every finding.
+And the database path, resolved through the RDS instance's own ENI:
 
-Useful flags:
-
-| Flag | Effect |
-| --- | --- |
-| `--all-regions` | scan every region enabled for the account |
-| `--deep` | also write a per-subnet diagram for every subnet |
-| `--reports` | also write the CSV/JSON/Markdown evidence files |
-| `--services core-only` | skip ELBv2, RDS, ECS, EKS, Lambda (faster, fewer permissions) |
-| `--cache-dir DIR` | cache location, default `<out>/.cache` |
-| `--offline` | rebuild all output from the cache, no AWS calls at all |
-| `--no-cache` | neither read nor write the cache |
-| `--no-diagrams` / `--no-rules` | skip diagrams, or the findings that annotate them |
-| `--max-workers N` | parallel API calls per region (default 8) |
-| `-q` | quieter console output |
-
-Re-render after tweaking rules or diagrams without re-collecting:
-
-```bash
-python3 aws_network_mapper.py --offline --cache-dir ./network-map/.cache --out ./network-map-2
+```
+EC2 app-01
+  │  TCP :5432   10.0.0.0/16 local   security: allowed
+  ▼
+RDS prod-postgres  (postgres :5432, 10.0.20.30, SG: sg-db)
 ```
 
-## Trying it without an AWS account
+Run `--demo` to see all of it, plus the findings engine reacting to deliberate
+misconfigurations: an unattached IGW in a route table, a NAT that cannot reach the
+internet, a security group open to everywhere, an orphaned NACL.
 
-```bash
-python3 aws_network_mapper.py --self-test     # 131 offline checks, no AWS calls
-python3 aws_network_mapper.py --demo --out ./demo
+---
+
+## CLI reference
+
+```
+--regions LIST          comma separated region list
+--all-regions           scan every region enabled for the account
+--out DIR               output directory (default: aws-network-map)
+--cache-dir DIR         raw response cache (default: <out>/.cache)
+--no-cache              neither read nor write the cache
+--offline               rebuild all output from the cache, no AWS calls at all
+--services LIST         comma separated subset of:
+                        ec2-workloads, elbv2, rds, ecs, eks, lambda, core-only
+--max-workers N         parallel API calls per region (default: 8)
+--reports               also write the CSV/JSON/Markdown evidence files
+--no-diagrams           skip the Mermaid diagram
+--no-rules              skip the findings that annotate it
+--deep                  evaluate more cross-VPC pairs for the reports
+--max-vpc-pairs N       cap on cross-VPC evaluations (default: 500)
+--max-diagram-vpcs N    VPCs drawn in the diagram (default: 60)
+--max-diagram-subnets N subnets drawn per VPC (default: 200)
+-q, --quiet             less console output
+--demo                  run the bundled synthetic scenario
+--self-test             run the offline checks and exit
 ```
 
-`--demo` runs a synthetic two-region account (6 VPCs, a transit gateway, a
-cross-region peering, NAT, an ALB with targets, RDS, EKS, ECS, Lambda, endpoints,
-plus deliberate misconfigurations) so you can see the output shape and the
-findings engine working.
+`core-only` skips the six optional service integrations, which is faster and
+needs fewer permissions:
 
-Outside CloudShell you need `pip install boto3`.
+```bash
+python3 aws_network_mapper.py --all-regions --services core-only --out ./map
+```
+
+Re-render after tweaking rules without re-collecting anything:
+
+```bash
+python3 aws_network_mapper.py --offline --cache-dir ./map/.cache --out ./map-2
+```
+
+Rendering is deterministic: the same inventory produces a byte-identical
+`.mmd`, which is asserted by the self-test.
+
+---
 
 ## Permissions
 
-Read-only EC2 plus the service APIs you enable. `--services core-only` needs:
+Read-only EC2, plus the service APIs you enable. `--services core-only` needs:
 
 ```
-ec2:DescribeVpcs            ec2:DescribeSubnets         ec2:DescribeRouteTables
-ec2:DescribeInternetGateways ec2:DescribeNatGateways    ec2:DescribeTransitGateways
-ec2:DescribeTransitGatewayAttachments          ec2:DescribeTransitGatewayRouteTables
-ec2:DescribeVpcPeeringConnections             ec2:DescribeVpcEndpoints
-ec2:DescribeNetworkInterfaces                  ec2:DescribeSecurityGroups
-ec2:DescribeNetworkAcls                       ec2:DescribeVpnGateways
-ec2:DescribeVpnConnections                     ec2:DescribeInstances
+ec2:DescribeVpcs                    ec2:DescribeSubnets
+ec2:DescribeRouteTables             ec2:DescribeInternetGateways
+ec2:DescribeNatGateways             ec2:DescribeTransitGateways
+ec2:DescribeTransitGatewayAttachments
+ec2:DescribeTransitGatewayRouteTables
+ec2:DescribeVpcPeeringConnections   ec2:DescribeVpcEndpoints
+ec2:DescribeNetworkInterfaces       ec2:DescribeSecurityGroups
+ec2:DescribeNetworkAcls             ec2:DescribeVpnGateways
+ec2:DescribeVpnConnections          ec2:DescribeInstances
 ec2:DescribeRegions
 ```
 
-The default service set additionally uses `elasticloadbalancing:DescribeLoadBalancers`,
-`elasticloadbalancing:DescribeTargetGroups`,
-`elasticloadbalancing:DescribeTargetHealth`, `elasticloadbalancing:DescribeListeners`,
-`elasticloadbalancing:DescribeRules`, `rds:DescribeDBInstances`,
-`ecs:DescribeServices`, `ecs:DescribeTaskDefinitions`, `ecs:DescribeTasks`,
-`ecs:ListClusters`, `ecs:ListTasks`, `ecs:ListServices`, `ecs:DescribeClusters`,
-`eks:DescribeClusters`, `eks:DescribeNodegroups`, `lambda:ListFunctions`.
+The default service set additionally uses:
+
+```
+elasticloadbalancing:DescribeLoadBalancers    elasticloadbalancing:DescribeTargetGroups
+elasticloadbalancing:DescribeTargetHealth     elasticloadbalancing:DescribeListeners
+rds:DescribeDBInstances                       rds:DescribeDBSubnetGroups
+ecs:ListClusters       ecs:DescribeClusters   ecs:ListServices
+ecs:DescribeServices   ecs:ListTasks          ecs:DescribeTasks
+eks:ListClusters       eks:DescribeCluster
+lambda:ListFunctions
+```
 
 Any missing permission is recorded in `logs/run.log` and in the
-`collection_errors` metric; the affected part of the report degrades instead of
-failing the run.
+`collection_errors` metric; the affected part of the output degrades instead of
+failing the run. A partially readable security group yields `security: unknown`
+on the paths it touches, never a false `allowed`.
 
-## Configuration-derived connectivity
-
-Every verdict in `cross-vpc-connectivity.csv` and `load-balancer-flows.csv` is
-derived from routing tables, gateway attachments and security groups. It answers
-"is this path configured correctly?", not "is traffic using it?".
-
-Actual flows need telemetry that is not part of configuration: VPC Flow Logs,
-Transit Gateway Flow Logs, or a Network Firewall. `NET018` flags VPCs with no
-flow logs, since without them you cannot tell configured from used.
-
-Each row carries a verdict, the reason, and the return-path verdict separately,
-because one-way routing is the most common finding in real accounts.
+---
 
 ## Rules
 
@@ -355,27 +502,83 @@ because one-way routing is the most common finding in real accounts.
 | `NET027` | high | VPC route table points at a transit gateway with no attachment |
 
 Findings carry the resource, region, VPC, the evidence string that triggered
-them, and a recommendation.
+them, and a recommendation. They annotate the diagram's nodes and are also
+written to `START-HERE.md` as a table.
 
-## Layout
+---
+
+## Reports
+
+`--reports` adds the evidence set. Every verdict in
+`cross-vpc-connectivity.csv` and `load-balancer-flows.csv` is derived from
+routing tables, gateway attachments and security groups — it answers "is this
+path configured correctly?", not "is traffic using it?".
+
+Each row carries a verdict, the reason, and the **return-path verdict
+separately**, because one-way routing is the most common finding in real
+accounts.
+
+---
+
+## Design notes
+
+The layers are deliberately separate, and the diagram is a *view* of the model,
+not a second implementation of it.
 
 ```
 aws_network_mapper.py    entry point
-nm/cidrutil.py           CIDR and IP helpers
-nm/model.py              normalized resource model and API parsing
-nm/collect.py            concurrent cached collection
-nm/topology.py           indexes, subnet to route table resolution
-nm/paths.py              route, gateway, peering and security group path evaluation
-nm/flow.py               normalized connectivity model: subnet classification,
-                         route arrows, workload arrows (reuses paths.py)
-nm/analysis.py           cross-VPC, load balancer, exposure, CIDR analyses
+nm/model.py              normalized resource model and API response parsing
+nm/collect.py            concurrent, cached, permission-tolerant collection
+nm/topology.py           indexes; subnet -> effective route table resolution
+nm/cidrutil.py           CIDR and IP helpers, longest-prefix match
+nm/paths.py              route, gateway, peering and security group evaluation
+nm/flow.py               the connectivity model the diagram is drawn from
+nm/analysis.py           cross-VPC, load balancer, exposure and CIDR analyses
 nm/findings.py           the rules above
-nm/mermaid.py            the single topology diagram renderer
+nm/mermaid.py            the single topology renderer
 nm/report.py             CSV, JSON and Markdown writers
 nm/cli.py                argument parsing and orchestration
-nm/fixtures.py           synthetic scenario
+nm/fixtures.py           synthetic two-region demo scenario
 nm/testing.py            fixture-backed collector used by the self-test
 nm/selftest.py           the offline checks
 ```
 
+Conventions the code holds to:
+
+- **Identity is the ARN when one exists.** Workloads are keyed by ARN, not by
+  name, so two clusters or services that share a name cannot overwrite each other
+  in the workloads map. The self-test asserts ids are unique.
+- **Nodes are rendered, never inferred.** `nm/flow.py` decides the topology;
+  `nm/mermaid.py` decides only how it looks. Adding a rendering concern never
+  requires touching path evaluation.
+- **Deterministic output.** Subgraph ids come from a counter, not `hash()`,
+  because Python randomizes string hashes per process. The same inventory yields
+  a byte-identical file.
+- **Every arrow has a referent.** If an arrow points at a node the renderer did
+  not emit, that node is drawn — Mermaid drops arrows to undeclared nodes and
+  reports a parse error.
+- **Degenerate inventory must not crash.** Missing subnets, absent ENIs, empty
+  target groups, a NAT whose subnet was never collected: each is handled and
+  asserted, because those are the shapes that appear in real accounts.
+
 Python 3.9+, standard library plus `boto3`.
+
+---
+
+## Limitations
+
+Worth knowing before you rely on a result:
+
+- **Configured, never observed.** There is no flow data. See
+  [Configured is not observed](#configured-is-not-observed).
+- **One arrow per target, not per listener.** A multi-listener load balancer puts
+  its primary listener on the arrow and lists the remaining listeners on the
+  node, rather than drawing a duplicate arrow for each one.
+- **ECS tasks are `RUNNING` only.** `PENDING` and `PROVISIONING` tasks have no
+  network interface to route through yet.
+- **Security group evaluation needs both ends.** If either side's groups are
+  unreadable the verdict is `unknown`, by design.
+- **Peering and TGW evaluation is bounded.** `--max-vpc-pairs` (default 500)
+  caps cross-VPC analysis for the reports; the diagram itself is not capped by it.
+- **The diagram is a text file.** Layout is Mermaid's problem, not the tool's.
+  Large accounts will need patience or a narrower region list.

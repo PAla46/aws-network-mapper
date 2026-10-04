@@ -13,13 +13,24 @@ This module does not talk to AWS. It reads the already-normalized
 Two hard rules encode the design brief:
 
 ``local`` is never a node
-    ``10.0.0.0/16 -> local`` authorizes traffic inside the VPC. It appears in the
+    ``10.0.0.0/16 local`` authorizes traffic inside the VPC. It appears in the
     *label* of an intra-VPC arrow; it never becomes a fake gateway box.
+
+Arrow labels name the route, never the destination
+    The arrowhead already says where an arrow goes, so repeating the target in
+    the label is noise. The one exception is ``local``, which names a mechanism
+    rather than a node.
 
 NACLs and security groups are never nodes
     They are metadata rendered inside the subnet / resource label. The only way
-    a security group reaches the diagram is a ``SG DENIES`` annotation on an
-    arrow whose route genuinely exists.
+    a security group reaches the diagram is the ``security:`` field on a path
+    edge -- ``allowed``, ``blocked``, or ``unknown``. It is stated on every path
+    edge, including when the answer is ``allowed``: an unevaluated rule must not
+    be indistinguishable from a permitted one.
+
+One arrow per journey
+    Each path is drawn once, in the direction traffic travels. A reverse arrow is
+    only drawn when routing really supports it, not as a mirror for symmetry.
 """
 
 from __future__ import annotations
@@ -721,10 +732,36 @@ def _resolve_target(topo: Topology, target: Dict[str, Any]) -> ResolvedTarget:
         return out
 
     if kind == "lambda":
-        wl = topo.workloads.get(target_id)
+        # The registration carries the function ARN, but be tolerant of a name.
+        wl = topo.workloads.get(target_id) or next(
+            (w for w in topo.workloads.values()
+             if w.kind == "lambda" and w.name == target_id),
+            None,
+        )
         out.workload = wl
         out.node = wid(wl.id) if wl is not None else wid(target_id)
-        out.note = "Lambda target has no ENI; no route is drawn"
+        if wl is None:
+            out.note = f"Lambda {target_id} is not in the inventory"
+            return out
+        # A function reached through an ALB has a VPC ENI, so the path is
+        # routable. Without one there is genuinely no path to draw, and saying
+        # so beats inventing an address.
+        eni = None
+        for eid in (wl.eni_ids or []):
+            candidate = topo.enis.get(eid)
+            if candidate is not None and candidate.private_ip:
+                eni = candidate
+                break
+        if eni is None:
+            eni = next(
+                (e for e in topo.enis.values()
+                 if e.private_ip and e.subnet_id in (wl.subnet_ids or [])),
+                None,
+            )
+        if eni is None:
+            out.note = "Lambda has no VPC ENI in the inventory; no route is drawn"
+            return out
+        out.eni, out.ip = eni, eni.private_ip
         return out
 
     out.note = f"unsupported target type {kind!r}"
@@ -760,13 +797,6 @@ def _add_workload_paths(model: FlowModel) -> None:
             port_txt = f":{front['port']}" if front and front.get("port") else ""
             proto = front.get("protocol") if front else ""
             front_label = f"{proto}{port_txt}".strip() if front else ""
-            others = [
-                f"{l.get('protocol')}{':' + str(l.get('port')) if l.get('port') else ''}"
-                for l in listeners
-                if l is not front
-            ]
-            if others:
-                model.note(wid(wl.id), f"also forwards {', '.join(others)}")
             tg_name = target.get("target_group") or ""
 
             res = None

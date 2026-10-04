@@ -991,6 +991,7 @@ def _us_east_1() -> Dict[str, Any]:
         "lambda.list_functions": [
             {
                 "FunctionName": "ingest-handler",
+                "FunctionArn": "arn:aws:lambda:us-east-1:111122223333:function:ingest-handler",
                 "Runtime": "python3.12",
                 "State": "Active",
                 "VpcConfig": {

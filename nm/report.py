@@ -395,18 +395,34 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
         "",
         "How to read it:",
         "",
-        "- **Boxes you can nest** are *location*: a subnet is where a resource lives.",
-        "- **Arrows are traffic paths.** Every arrow is labelled with the route that "
-        "creates it (`0.0.0.0/0 --> NAT Gateway`) or the port and route for a "
-        "workload-to-workload path (`TCP :5432` / `via 10.0.0.0/16 local`).",
+        "This file is pure architecture: containers, nodes and arrows, no totals and no "
+        "summary box. The counts live in the console output instead.",
+        "",
+        "- **Boxes you can nest** are *location*: `AWS Account > VPC > Availability Zone > "
+        "Subnet`, and a resource sits inside the subnet it is attached to.",
+        "- **Arrows are traffic paths.** Each is labelled with the route that creates it "
+        "(`0.0.0.0/0`) or, for a workload-to-workload path, the port and route "
+        "(`TCP :5432` / `10.0.0.0/16 local`).",
+        "- **An arrow label names the route, never the node it points at.** The arrowhead "
+        "already says where it goes, so repeating the destination is noise.",
+        "- **Each journey is drawn once, in the direction traffic travels.** Inbound is "
+        "`INTERNET > IGW > public subnet > ALB`; outbound is `private subnet > NAT > IGW > "
+        "INTERNET`. A mirrored pair is not drawn just because the reverse is possible.",
+        "- **`security:` on a path edge** is the verdict of the security group rules: "
+        "`allowed`, `blocked`, or `unknown`. `unknown` means the rules could not be fully "
+        "evaluated (missing permission, or an ENI whose groups were not collected) and is "
+        "deliberately not the same as `allowed`. It is never folded into `blocked`.",
         "- **`local` is never a node.** It appears in an arrow label, because it is "
         "intra-VPC routing, not a gateway.",
         "- **NACLs are not nodes.** They appear in the subnet header "
-        "(`NACL: acl-... (4 in / 2 out)`) because they filter at the subnet boundary.",
+        "(`NACL: acl-... · 2 in / 0 out`) because they filter at the subnet boundary.",
         "- **Security groups are not nodes.** They appear inside the resource "
-        "(`SG: sg-...`, plus inbound rules) because they filter at the ENI.",
-        "- **`SG DENIES` on an arrow** means the route genuinely exists but a security "
-        "group blocks it. The route is still a route; the block is not a fake hop.",
+        "(`SG: sg-...`) because they filter at the ENI.",
+        "- **A blocked path keeps its arrow.** The route genuinely exists and a security "
+        "group refuses the traffic; the route is still a route, and the block is not drawn "
+        "as a fake hop.",
+        "- **A target group is not a node.** It is metadata on the arrow that uses it, and "
+        "an arrow only exists when the target group has a real registration.",
         "- **A region with no default route** is drawn as `ISOLATED`, and that "
         "classification is derived from the route table, not the subnet name.",
         "",
