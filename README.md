@@ -18,10 +18,13 @@ Default output is diagrams only:
 ```
 <out>/
   START-HERE.md              what to open first, and every finding in a table
-  00-overview.mmd            all VPCs, TGWs, peerings, IGWs, on-prem, internet
-  01-transit-gateways.mmd    attachments, TGW route tables, associations
-  02-internet-paths.mmd      IGWs, NAT gateways, public subnets, EIPs
-  vpcs/<region>-<name>-<id>.mmd    one per VPC: subnets, route tables, gateways
+  00-data-flow.mmd           THE one to read: internet -> gateways -> subnets
+                             -> workloads -> ENIs -> security groups -> ports
+  01-overview.mmd            all VPCs, TGWs, peerings, IGWs, on-prem, internet
+  02-transit-gateways.mmd    attachments, TGW route tables, associations
+  03-internet-paths.mmd      IGWs, NAT gateways, public subnets, EIPs
+  vpcs/<region>-<name>-<id>-flow.mmd   layered flow for one VPC
+  vpcs/<region>-<name>-<id>.mmd        same VPC as a reference diagram
   logs/run.log
 ```
 
@@ -44,8 +47,35 @@ CSV/Markdown evidence set:
 Each `.mmd` file is Mermaid text. Paste one into <https://mermaid.live>, or render:
 
 ```bash
-npx -y @mermaid-js/mermaid-cli -i 00-overview.mmd -o overview.svg
+npx -y @mermaid-js/mermaid-cli -i 00-data-flow.mmd -o flow.svg
 ```
+
+## The data-flow diagram
+
+`00-data-flow.mmd` is the point of the tool. It lays the network out in the order
+a packet crosses it, so you can read it top to bottom:
+
+```
+INTERNET
+  |  HTTPS/80/443
+Internet Gateway
+  |  routes here
+public subnet          (route table named on the node)
+  |  hosts
+ALB / EC2
+  |  :8080             (load balancer target port)
+EC2 target
+  |
+ENI                    (private and public IPs)
+  |  uses
+Security group
+  |  allows
+ingress TCP 8080 from sg sg-alb
+```
+
+Subnets are grouped into public / private / data tiers, and every arrow is a real
+configured route, a real load balancer target, or a real security group rule,
+not a generic association. Per-VPC versions of the same diagram are under `vpcs/`.
 
 ## Running it in CloudShell
 

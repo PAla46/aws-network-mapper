@@ -245,14 +245,21 @@ def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger)
         report.write_text(path, content)
         written.append(name)
 
-    save("00-overview.mmd", mermaid.render_overview(topo, max_vpcs=args.max_diagram_vpcs))
-    save("01-transit-gateways.mmd", mermaid.render_tgw(topo))
-    save("02-internet-paths.mmd", mermaid.render_internet(topo))
+    # The whole-account flow diagram is the one to open first.
+    save("00-data-flow.mmd", mermaid.render_flow(topo))
+    save("01-overview.mmd", mermaid.render_overview(topo, max_vpcs=args.max_diagram_vpcs))
+    save("02-transit-gateways.mmd", mermaid.render_tgw(topo))
+    save("03-internet-paths.mmd", mermaid.render_internet(topo))
 
     for vpc in sorted(topo.vpcs.values(), key=lambda v: (v.region, v.id)):
-        fname = f"{vpc.region}-{mermaid.slug(vpc.label)}-{vpc.id}.mmd"
+        base = f"{vpc.region}-{mermaid.slug(vpc.label)}-{vpc.id}"
         report.write_text(
-            os.path.join(vpc_dir, fname),
+            os.path.join(vpc_dir, f"{base}-flow.mmd"),
+            mermaid.render_flow(topo, vpc.id),
+        )
+        written.append(f"vpcs/{base}-flow.mmd")
+        report.write_text(
+            os.path.join(vpc_dir, f"{base}.mmd"),
             mermaid.render_vpc(
                 topo,
                 vpc.id,
@@ -260,7 +267,7 @@ def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger)
                 max_workloads=args.max_diagram_subnets,
             ),
         )
-        written.append(f"vpcs/{fname}")
+        written.append(f"vpcs/{base}.mmd")
 
     # Per-subnet drill-downs are only useful when chasing a specific path.
     interesting = set(topo.subnets) if args.deep else set()
