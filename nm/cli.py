@@ -141,9 +141,11 @@ def run_demo(out_dir: str, logger: Logger, args) -> int:
 
     fixtures = build_fixtures()
     logger("demo mode: using the bundled synthetic scenario (no AWS API calls)")
+    # Honour --cache-dir so a demo run can seed a cache that a later --offline
+    # run rebuilds from. Hardcoding None silently ignored the flag.
     collector = FixtureCollector(
         fixtures,
-        cache_dir=None,
+        cache_dir="" if args.no_cache else (args.cache_dir or os.path.join(out_dir, ".cache")),
         services=CORE_SERVICES,
         log=logger,
         pool_factory=lambda region: FakePool(region),

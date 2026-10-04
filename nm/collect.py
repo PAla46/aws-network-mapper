@@ -16,7 +16,6 @@ import concurrent.futures as cf
 import json
 import os
 import threading
-from dataclasses import asdict
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import model as M
@@ -281,6 +280,13 @@ class Collector:
         self._resolve_subnet_routes(snap)
         self._resolve_workload_vpcs(snap)
         self._attribute_enis(snap)
+        # The optional collectors run concurrently and each appends to
+        # snap.workloads, so list order follows thread completion rather than
+        # anything stable. That made node numbering (and therefore the rendered
+        # diagram) differ between runs of the same account. Sort once here so
+        # output is byte-identical for identical input.
+        snap.workloads.sort(key=lambda w: (w.kind, w.vpc_id, w.id))
+        snap.errors.sort()
         return snap
 
     # -- generic cached call --------------------------------------------
@@ -773,7 +779,8 @@ class Collector:
         client = pool.get("ecs")
 
         def clusters():
-            return [c["clusterArn"] for c in _paged(client, "list_clusters", "clusterArns")]
+            # list_clusters returns clusterArns as plain strings, not dicts.
+            return list(_paged(client, "list_clusters", "clusterArns"))
 
         cluster_arns = self._call(region, "ecs.list_clusters", clusters)
         if not cluster_arns:
@@ -804,10 +811,10 @@ class Collector:
                 services = self._call(
                     region,
                     f"ecs.services:{cluster.get('clusterName')}",
-                    lambda arn=cluster.get("clusterArn", ""): [
-                        s["serviceArn"]
-                        for s in _paged(client, "list_services", "serviceArns", cluster=arn)
-                    ],
+                    # list_services also returns bare ARN strings.
+                    lambda arn=cluster.get("clusterArn", ""): list(
+                        _paged(client, "list_services", "serviceArns", cluster=arn)
+                    ),
                 )
                 if not services:
                     continue

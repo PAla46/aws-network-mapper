@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional
 
 from . import model as M
-from .cidrutil import ip_in_net, nets_overlap, parse_ip
+from .cidrutil import ip_in_net, nets_overlap
 from .model import AccountSnapshot, Eni, RouteTable, SecurityGroup, Subnet, Vpc, Workload
 
 

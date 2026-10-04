@@ -33,6 +33,7 @@ CLASSES = {
     "nat": ("fill:#cffafe,stroke:#0e7490,color:#0f172a",),
     "tgw": ("fill:#ede9fe,stroke:#6d28d9,color:#1e1b4b",),
     "peering": ("fill:#f5d0fe,stroke:#a21caf,color:#3b0764",),
+    "vgw": ("fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b",),
     "endpoint": ("fill:#ccfbf1,stroke:#0f766e,color:#042f2e",),
     "public": ("fill:#fed7aa,stroke:#c2410c,color:#431407",),
     "private": ("fill:#e2e8f0,stroke:#475569,color:#0f172a",),
@@ -238,6 +239,20 @@ MAX_SG_RULES = 2
 CLASS_ORDER = {"public": 0, "private": 1, "isolated": 2}
 
 
+def _known_node_ids(topo: Topology) -> Set[str]:
+    """Every node id the topology could legitimately produce, drawn or not."""
+    ids: Set[str] = {flow.internet_node(), flow.onprem_node()}
+    ids.update(flow.sid(s.id) for s in topo.subnets.values())
+    ids.update(flow.wid(w.id) for w in topo.workloads.values())
+    for kind, coll in (
+        ("igw", topo.igws), ("nat", topo.nat_gateways), ("tgw", topo.tgws),
+        ("pcx", topo.peerings), ("vpce", topo.endpoints), ("vgw", topo.vpn_gateways),
+    ):
+        ids.update(flow.nid(kind, r.id) for r in coll.values())
+    ids.update(flow.nid("eni", e.id) for e in topo.enis.values())
+    return ids
+
+
 def render_topology(
     topo: Topology,
     model: Optional["flow.FlowModel"] = None,
@@ -315,6 +330,28 @@ def render_topology(
     for vpc in vpcs:
         _emit_vpc(b, model, topo, vpc, defined, max_subnets)
 
+    # Anything an arrow points at must exist, or Mermaid drops the arrow (and
+    # reports a parse error). A resource can be referenced without being drawn:
+    # its subnet failed collection, or its VPC was over the diagram budget. Emit
+    # a placeholder rather than a dangling reference.
+    referenced = {e.src for e in model.edges} | {e.dst for e in model.edges}
+    known = _known_node_ids(topo)
+    for node in sorted(referenced - defined):
+        # Two very different reasons for a missing node, and conflating them
+        # would send you hunting for a resource that is right there in the API.
+        if node in known:
+            why = "exists, but over the diagram budget\nraise --max-diagram-vpcs / --max-diagram-subnets"
+        else:
+            why = "not present in the inventory\nits subnet or VPC may have failed collection"
+        b.node(
+            node,
+            f"OFF DIAGRAM\n{node.replace('_', ' ')}\nreferenced by a route\n{why}",
+            "round",
+            "blocked",
+            220,
+        )
+        defined.add(node)
+
     # -- arrows -----------------------------------------------------------
     for edge in model.edges:
         if edge.src in defined and edge.dst in defined:
@@ -360,13 +397,9 @@ def _emit_vpc(b, model, topo, vpc, defined: Set[str], budget: int) -> None:
             if vgw.vpc_id != vpc.id:
                 continue
             node = flow.nid("vgw", vgw.id)
-            b.node(
-                node,
-                f"VIRTUAL PRIVATE GATEWAY\n{vgw.id}\n{vgw.state or ''}",
-                "round",
-                "peering",
-                200,
-            )
+            label = f"VPN GATEWAY\n{vgw.id}\n{vgw.state or ''}\n{vgw.vpn_type or ''}"
+            label = "\n".join([label, *model.notes.get(node, [])])
+            b.node(node, label, "round", "vgw", 200)
             defined.add(node)
 
         for peer in topo.peerings_by_vpc.get(vpc.id, []):

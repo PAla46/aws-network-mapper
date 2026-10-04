@@ -168,6 +168,7 @@ def _eu_west_1() -> Dict[str, Any]:
                 "Routes": [
                     _route("10.50.0.0/16", "GatewayId", "local"),
                     _route("10.0.0.0/16", "TransitGatewayId", "tgw-hub"),
+                    _route("192.168.0.0/16", "GatewayId", "vgw-sandbox"),
                 ],
                 "Tags": _tags("sandbox-main"),
             },
@@ -292,8 +293,31 @@ def _eu_west_1() -> Dict[str, Any]:
                 "Options": {"AllowDnsResolutionFromRemoteVpc": False},
             }
         ],
-        "describe_vpn_gateways": [],
-        "describe_vpn_connections": [],
+        "describe_vpn_gateways": [
+            {
+                "VpnGatewayId": "vgw-sandbox",
+                "State": "available",
+                "Type": "ipsec.1",
+                "AmazonSideAsn": "64512",
+                "VpcAttachments": [{"VpcId": "vpc-sandbox", "State": "attached"}],
+                "Tags": _tags("sandbox-to-corp"),
+            }
+        ],
+        "describe_vpn_connections": [
+            {
+                "VpnConnectionId": "vpn-conn-sandbox",
+                "State": "established",
+                "Type": "ipsec.1",
+                "VpnGatewayId": "vgw-sandbox",
+                "CustomerGatewayId": "cgw-hq",
+                "VgwTelemetry": [
+                    {"VpcId": "vpc-sandbox", "Status": "UP",
+                     "DestinationCidrBlock": "10.0.0.0/8"},
+                    {"VpcId": "vpc-sandbox", "Status": "UP",
+                     "DestinationCidrBlock": "0.0.0.0/0"},
+                ],
+            }
+        ],
         "describe_vpc_endpoints": [
             {
                 "VpcEndpointId": "vpce-s3-prod",

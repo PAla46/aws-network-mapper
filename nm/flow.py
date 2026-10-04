@@ -100,6 +100,7 @@ class SubnetRouting:
     rtb_name: str = ""
     classification: str = ISOLATED
     default_route: Optional[M.Route] = None
+    default_target_kind: str = ""
     egress: List[M.Route] = field(default_factory=list)
     hazards: List[M.Route] = field(default_factory=list)
 
@@ -150,6 +151,7 @@ def classify_subnet(topo: Topology, subnet: M.Subnet) -> SubnetRouting:
 
     if info.default_route is not None:
         kind = target_kind(info.default_route)
+        info.default_target_kind = kind
         info.classification = PUBLIC if kind == "igw" else PRIVATE
 
     info.hazards = [
@@ -288,17 +290,60 @@ def _add_external(model: FlowModel) -> None:
         model.edge(internet_node(), node, "inbound", kind="wan")
         model.edge(node, internet_node(), "egress", kind="wan")
 
+    # A VPN gateway reaches on-premises, not the internet. Only a VPN connection
+    # whose routes include 0.0.0.0/0 actually carries internet-bound traffic, so
+    # the internet leg is drawn for that case alone rather than for every VGW.
+    for vgw in topo.vpn_gateways.values():
+        node = nid("vgw", vgw.id)
+        conns = [c for c in topo.vpn_connections.values() if c.vgw_id == vgw.id]
+        tunnel = "Direct Connect" if _is_direct_connect(vgw.vpn_type) else "IPsec tunnel"
+        model.edge(onprem_node(), node, tunnel, kind="wan")
+        model.edge(node, onprem_node(), tunnel, kind="wan")
+        if not conns and not vgw.vpc_id:
+            model.note(node, f"not attached to any VPC · {vgw.id}")
+        for conn in conns:
+            model.note(node, f"{conn.vpn_type or 'ipsec.1'} → {conn.customer_gw_id or 'customer gateway'}")
+            if any(r.strip() in ("0.0.0.0/0", "::/0") for r in (conn.routes or [])):
+                model.edge(node, internet_node(), "0.0.0.0/0 → on-premises network", kind="wan")
+
     if topo.vpn_gateways or topo.vpn_connections:
-        for vgw in topo.vpn_gateways.values():
-            node = nid("vgw", vgw.id)
-            model.edge(internet_node(), node, "VPN tunnel", kind="wan")
-            model.edge(onprem_node(), node, "corporate network", kind="wan")
         model.note(onprem_node(), "customer gateway / on-premises")
 
+    # A transit gateway reaches the outside world only through the attachments
+    # that actually exist on it. A TGW with nothing but VPC attachments has no
+    # Direct Connect and no internet path, and drawing either would be a lie.
     for tgw in list(topo.tgws.values())[:MAX_TGWS]:
         node = nid("tgw", tgw.id)
-        model.edge(onprem_node(), node, "Direct Connect", kind="wan")
-        model.edge(node, internet_node(), "egress", kind="wan")
+        types = {a.resource_type for a in (tgw.attachments or [])}
+        if "dx-gateway" in types:
+            model.edge(onprem_node(), node, "Direct Connect", kind="wan")
+            model.edge(node, onprem_node(), "Direct Connect", kind="wan")
+        if "vpn" in types:
+            model.edge(onprem_node(), node, "IPsec tunnel", kind="wan")
+            model.edge(node, onprem_node(), "IPsec tunnel", kind="wan")
+        if _tgw_carries_internet(tgw):
+            model.edge(node, internet_node(), "0.0.0.0/0", kind="wan")
+        model.note(node, f"{len(tgw.attachments or [])} attachment(s) · {len(tgw.route_tables or [])} route table(s)")
+
+
+def _is_direct_connect(vpn_type: str) -> bool:
+    """True for Direct Connect gateway types (``vgw``, ``dxgw``)."""
+    t = (vpn_type or "").lower()
+    return t.startswith("vgw") or t.startswith("dxgw") or t.startswith("dx")
+
+
+def _tgw_carries_internet(tgw) -> bool:
+    """True when some TGW route table sends 0.0.0.0/0 to a VPN or DX attachment."""
+    outside = {"vpn", "dx-gateway"}
+    for rtb in tgw.route_tables or []:
+        att_by_id = {a.id: a for a in (tgw.attachments or [])}
+        for route in rtb.routes or []:
+            if route.destination.strip() not in ("0.0.0.0/0", "::/0"):
+                continue
+            att = att_by_id.get(route.attachment_id or route.target_id)
+            if att is not None and att.resource_type in outside:
+                return True
+    return False
 
 
 def _add_subnet_egress(model: FlowModel) -> None:
@@ -326,10 +371,17 @@ def _add_subnet_egress(model: FlowModel) -> None:
                 model.edge(source, nat_node, label, kind="route")
                 if nat is not None:
                     host = topo.subnets.get(nat.subnet_id or "")
-                    model.note(
-                        nat_node,
-                        f"{host.az or 'unknown AZ'} / {host.cidr if host else 'unknown subnet'}",
-                    )
+                    # The NAT's subnet can be absent from the inventory (failed
+                    # collection, or a cross-account reference), so never assume it.
+                    if host is not None:
+                        model.note(
+                            nat_node,
+                            f"{host.az or 'unknown AZ'} / {host.cidr or 'no CIDR'}",
+                        )
+                    else:
+                        model.note(
+                            nat_node, f"subnet {nat.subnet_id} not found in inventory"
+                        )
                 igw = topo.igw_for_vpc(subnet.vpc_id)
                 if igw is not None:
                     model.edge(
@@ -347,6 +399,10 @@ def _add_subnet_egress(model: FlowModel) -> None:
                     _add_ingress_endpoints(model, topo, subnet)
                 continue
 
+            # A route to a VPN gateway leaves for on-premises, so complete the
+            # leg to the on-premises node instead of stopping at the gateway.
+            # The vgw <-> on-premises tunnel edge is drawn once in _add_external,
+            # so this stops at the gateway instead of duplicating that arrow.
             model.edge(source, nid("vgw", route.target_id), label, kind="route")
 
 

@@ -125,7 +125,8 @@ not nodes here:
 | --- | --- | --- |
 | Subnet | where the resource lives | container, with id/CIDR/AZ/route table/NACL |
 | Route table | where traffic goes next | on the subnet header, and as the label on each arrow |
-| IGW / NAT / TGW / peering / VGW / VPN | how networks connect | nodes on the traffic path |
+| IGW / NAT / TGW / peering / VPCE | how networks connect | nodes on the traffic path |
+| VPN gateway | how a VPC reaches on-premises | node, joined to ON-PREMISES |
 | NACL | subnet-level filtering | `NACL: acl-...  4 in / 2 out` in the subnet header |
 | Security group | ENI-level filtering | `SG: sg-...` plus inbound rules in the resource node |
 | Resource | where traffic terminates | node inside its subnet |
@@ -165,6 +166,14 @@ An arrow is only drawn when real configuration supports it:
 - a Transit Gateway route table entry that actually delivers into an attached
   VPC, resolved further through *that* VPC's own route table
 - a VPC peering that some route table actually points at
+
+Gateways are not given reachability they do not have. A VPN gateway is wired to
+ON-PREMISES, not to the internet; it only grows an internet leg when one of its
+VPN connections actually advertises a `0.0.0.0/0` route. A transit gateway only
+grows a Direct Connect or IPsec leg when it has a `dx-gateway` or `vpn`
+attachment, and only grows an internet leg when a TGW route table really sends
+`0.0.0.0/0` to one of those attachments. A TGW with nothing but VPC attachments
+has neither.
 
 Arrows show **configured reachability**, not observed traffic. The diagram says
 "network path" and "route exists", never "application talks to". If a route

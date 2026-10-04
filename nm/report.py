@@ -6,7 +6,7 @@ import csv
 import dataclasses
 import json
 import os
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import model as M
 from .analysis import (
@@ -436,7 +436,9 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
             lines.append(f"| `{rule_id}` | {sev[rule_id]} | {res} |")
         lines += ["", "A warning icon on a node in a diagram marks a finding on it.", ""]
     else:
-        lines.append("None.", "")
+        # append() takes one argument; this used to raise TypeError on any
+        # account that produced no findings at all.
+        lines += ["None.", ""]
     return "\n".join(lines) + "\n"
 
 

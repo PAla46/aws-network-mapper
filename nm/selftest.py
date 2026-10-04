@@ -12,7 +12,7 @@ import os
 import re
 import shutil
 import tempfile
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from . import analysis, flow, mermaid, report
 from .collect import Collector
@@ -450,6 +450,20 @@ def run_self_test(verbose: bool = True) -> int:
             not re.search(r'\[(?:SUBNET )?acl-', t) and not re.search(r'\[SG ', t))
     c.check("no dangling node references",
             "unresolved" not in t, "a node was referenced but never defined")
+    # Structural reference integrity: every node an arrow mentions must be
+    # declared by a node statement, or Mermaid drops the arrow.
+    declared = set(re.findall(r"^\s*(n\d+)[\[({]", t, re.M))
+    mentioned = set(re.findall(r"\b(n\d+)\b", t))
+    arrow_targets = set()
+    for line in t.splitlines():
+        mm = re.match(r"^\s*(n\d+)\s*-->\|?[^|]*\|?\s*(n\d+)", line)
+        if mm:
+            arrow_targets.update(mm.groups())
+    c.check("every node used in an arrow is declared",
+            arrow_targets <= declared,
+            f"missing={sorted(arrow_targets - declared)}")
+    c.check("the complete fixture needs no OFF DIAGRAM placeholders",
+            "OFF DIAGRAM" not in t)
     az_containers = len(re.findall(r'^subgraph sg\d+\["AVAILABILITY ZONE ', t, re.M))
     subnet_containers = len(re.findall(r'^subgraph sg\d+\["\w+ SUBNET  \u00b7', t, re.M))
     c.check("exactly one AZ container per (vpc, az) and one subnet container per subnet",
@@ -482,6 +496,198 @@ def run_self_test(verbose: bool = True) -> int:
     c.check("the link checker passes valid styles", not _invalid_styles({"ok": broken["ok"]}))
 
     # ---------------------------------------------------------------- reports
+    # ---------------------------------------------------- live-shape regressions
+    print("\n[6b/8] live AWS response shapes")
+
+    # Regression: ECS list_clusters / list_services return ARNs as plain strings.
+    # The collector used to subscript them as dicts, which raised
+    # "TypeError: string indices must be integers" against a real account.
+    from .collect import Collector
+    from .model import AccountSnapshot as _Snap
+
+    class _EcsClient:
+        def list_clusters(self, **kw):
+            return {"clusterArns": ["arn:aws:ecs:eu-west-1:111122223333:cluster/prod"]}
+
+        def describe_clusters(self, clusters=None, **kw):
+            return {
+                "clusters": [
+                    {
+                        "clusterArn": clusters[0],
+                        "clusterName": "prod",
+                        "status": "ACTIVE",
+                        "resourcesVpcConfig": {
+                            "vpcId": "vpc-prod",
+                            "subnetIds": ["subnet-app-1"],
+                            "securityGroups": ["sg-app"],
+                        },
+                        "registeredContainerInstancesCount": 3,
+                    }
+                ]
+            }
+
+        def list_services(self, cluster=None, **kw):
+            return {"serviceArns": [f"{cluster}/svc-web"]}
+
+        def describe_services(self, cluster=None, services=None, **kw):
+            return {
+                "services": [
+                    {
+                        "serviceArn": services[0],
+                        "serviceName": "svc-web",
+                        "status": "ACTIVE",
+                        "desiredCount": 2,
+                        "networkConfiguration": {
+                            "awsvpcConfiguration": {
+                                "subnets": ["subnet-app-1"],
+                                "securityGroups": ["sg-app"],
+                            }
+                        },
+                    }
+                ]
+            }
+
+    class _Pool:
+        def get(self, service):
+            return _EcsClient()
+
+    class _OfflineCollector(Collector):
+        """Real Collector logic, but no boto3 session (the self-test has none)."""
+
+        def start(self) -> None:
+            self._started = True
+
+    from .model import Subnet as _Sub
+
+    snap = _Snap(region="eu-west-1")
+    # Subnets are collected before ECS, so the service's VPC can be inferred.
+    snap.subnets = [
+        _Sub(id="subnet-app-1", region="eu-west-1", vpc_id="vpc-prod", cidr="10.0.10.0/24", az="eu-west-1a")
+    ]
+    col = _OfflineCollector(regions=["eu-west-1"])
+    col.start()
+    try:
+        col._collect_ecs(_Pool(), "eu-west-1", snap)
+        names = {w.name for w in snap.workloads}
+        c.check("ECS cluster ARNs are handled as strings, not dicts",
+                "prod" in names, str(sorted(names)))
+        c.check("ECS service ARNs are handled as strings, not dicts",
+                "svc-web" in names, str(sorted(names)))
+        svc = next((w for w in snap.workloads if w.name == "svc-web"), None)
+        c.check("ECS service is placed in the VPC implied by its subnets",
+                svc is not None and svc.vpc_id == "vpc-prod",
+                svc.vpc_id if svc else "missing")
+    except Exception as exc:  # noqa: BLE001
+        c.check("ECS collection does not raise on string ARN lists", False, repr(exc))
+
+    # Regression: a NAT gateway can reference a subnet that never made it into the
+    # inventory. Rendering used to dereference the missing subnet and crash the run
+    # with "'NoneType' object has no attribute 'az'".
+    from .model import NatGw, Route, RouteTable, Subnet as _Subnet
+
+    broken_snap = _Snap(region="eu-west-1")
+    broken_snap.subnets = [
+        _Subnet(id="subnet-app-1", region="eu-west-1", vpc_id="vpc-x",
+                cidr="10.9.0.0/24", az="eu-west-1a", rtb_id="rtb-1"),
+    ]
+    # The default route points at a NAT gateway whose own subnet never made it
+    # into the inventory (failed collection, or a cross-account reference).
+    broken_snap.route_tables = [
+        RouteTable(
+            id="rtb-1", region="eu-west-1", vpc_id="vpc-x", subnet_ids=["subnet-app-1"],
+            routes=[Route(destination="0.0.0.0/0", target_kind="nat", target_id="nat-dangling")],
+        )
+    ]
+    broken_snap.nat_gateways = [
+        NatGw(id="nat-dangling", region="eu-west-1", subnet_id="subnet-not-collected",
+              vpc_id="vpc-x", state="available", connect_type="public",
+              address="eipalloc-x", tags={})
+    ]
+    try:
+        m2 = flow.build_flow_model(Topology([broken_snap]))
+        nat_node = flow.nid("nat", "nat-dangling")
+        drawn = [e for e in m2.edges if e.src == flow.sid("subnet-app-1")]
+        c.check("a NAT gateway pointing at an uncollected subnet does not crash the model", True)
+        c.check("the egress arrow to the dangling NAT is still drawn",
+                any(e.dst == nat_node for e in drawn),
+                str([(e.src, e.dst) for e in drawn]))
+        c.check("the missing subnet is explained in the diagram, not silently dropped",
+                any("not found in inventory" in n for n in m2.notes.get(nat_node, [])),
+                str(m2.notes.get(nat_node)))
+    except Exception as exc:  # noqa: BLE001
+        c.check("a NAT gateway pointing at an uncollected subnet does not crash the model",
+                False, repr(exc))
+
+    # ------------------------------------------------------- WAN edge semantics
+    print("\n[6c/8] external network semantics")
+
+    col2 = FixtureCollector(
+        build_fixtures(),
+        cache_dir=None,
+        services=("ec2-workloads", "elbv2", "rds", "ecs", "eks", "lambda"),
+        pool_factory=lambda region: FakePool(region),
+    )
+    col2.start()
+    m3 = flow.build_flow_model(
+        Topology([col2.collect_region(region) for region in build_fixtures()])
+    )
+
+    def _edge(a, b):
+        return [(e.src, e.dst, e.label) for e in m3.edges if e.src == a and e.dst == b]
+
+    def _has(a, b):
+        return any(es == a and ed == b for es, ed, _lbl in _edge(a, b))
+
+    vgw_node = flow.nid("vgw", "vgw-sandbox")
+    onprem = flow.onprem_node()
+    net = flow.internet_node()
+
+    c.check("a subnet routed to a VPN gateway continues on-premises",
+            _has(vgw_node, onprem), str(_edge(vgw_node, onprem)))
+    c.check("a VPN gateway is labelled by tunnel type, not 'VPN tunnel'",
+            any("IPsec" in lbl for _s, _d, lbl in _edge(onprem, vgw_node)),
+            str(_edge(onprem, vgw_node)))
+    c.check("the VPN gateway internet leg names the on-premises network",
+            all("on-premises" in lbl for _s, _d, lbl in _edge(vgw_node, net)),
+            str(_edge(vgw_node, net)))
+    c.check("a VPN gateway never claims a direct Internet Gateway hop",
+            all("Internet Gateway" not in lbl for _s, _d, lbl in _edge(vgw_node, net)),
+            str(_edge(vgw_node, net)))
+
+    # The demo transit gateway has only VPC attachments, so it has no path to
+    # either Direct Connect or the internet. Drawing either would be a fiction.
+    tgw_node = flow.nid("tgw", "tgw-hub")
+    c.check("a TGW with only VPC attachments has no Direct Connect leg",
+            _edge(onprem, tgw_node) == [], str(_edge(onprem, tgw_node)))
+    c.check("a TGW with only VPC attachments has no internet leg",
+            _edge(tgw_node, net) == [], str(_edge(tgw_node, net)))
+
+    # A TGW that really does front a VPN attachment must gain both legs.
+    from .model import Tgw, TgwAttachment, TgwRoute, TgwRouteTable
+    dx_snap = _Snap(region="eu-west-1")
+    dx_snap.tgws = [
+        Tgw(id="tgw-dx", region="eu-west-1", state="available",
+            attachments=[
+                TgwAttachment(id="tgw-attach-vpc", tgw_id="tgw-dx", region="eu-west-1",
+                              resource_type="vpc", vpc_id="vpc-x", subnet_ids=[], cidr_blocks=[], tags={}),
+                TgwAttachment(id="tgw-attach-vpn", tgw_id="tgw-dx", region="eu-west-1",
+                              resource_type="vpn", vpc_id="", subnet_ids=[], cidr_blocks=[], tags={}),
+            ],
+            route_tables=[
+                TgwRouteTable(id="tgw-rtb", tgw_id="tgw-dx", region="eu-west-1",
+                              routes=[TgwRoute(destination="0.0.0.0/0", target_kind="vpn",
+                                               target_id="tgw-attach-vpn",
+                                               attachment_id="tgw-attach-vpn")])
+            ])
+    ]
+    m4 = flow.build_flow_model(Topology([dx_snap]))
+    dx_node = flow.nid("tgw", "tgw-dx")
+    dx_edges = {(e.src, e.dst) for e in m4.edges}
+    c.check("a TGW with a VPN attachment does get an on-premises leg",
+            (flow.onprem_node(), dx_node) in dx_edges, str(sorted(dx_edges)))
+    c.check("a TGW whose route table sends 0.0.0.0/0 to VPN does get an internet leg",
+            (dx_node, flow.internet_node()) in dx_edges, str(sorted(dx_edges)))
+
     print("\n[7/8] CSV / JSON / Markdown output")
     tmp = tempfile.mkdtemp(prefix="nm-selftest-")
     try:
@@ -538,6 +744,72 @@ def run_self_test(verbose: bool = True) -> int:
         c.eq("offline rebuild matches live summary", offline_topo.summary(), topo.summary())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # Regression: an account with no findings at all used to crash report
+    # generation with "append() takes exactly one argument (2 given)".
+    try:
+        empty_md = report.start_here_markdown(topo, [], ["00-network-topology.mmd"])
+        c.check("START-HERE renders for an account with zero findings", True)
+        c.check("a clean account is told there are no findings",
+                "None" in empty_md or "none" in empty_md.lower(), empty_md[:120])
+    except Exception as exc:  # noqa: BLE001
+        c.check("START-HERE renders for an account with zero findings", False, repr(exc))
+
+    # Determinism must not be a coin flip. Two runs can agree by luck, so check
+    # the property directly: the optional collectors append to snap.workloads
+    # from a thread pool, so collect_region must hand back a sorted list.
+    col4 = FixtureCollector(
+        build_fixtures(), cache_dir=None,
+        services=("ec2-workloads", "elbv2", "rds", "ecs", "eks", "lambda"),
+        pool_factory=lambda region: FakePool(region),
+    )
+    col4.start()
+    ordered = [col4.collect_region(region) for region in build_fixtures()]
+    for snap4 in ordered:
+        keys = [(w.kind, w.vpc_id, w.id) for w in snap4.workloads]
+        c.check(f"{snap4.region}: collected workloads are sorted, not thread-ordered",
+                keys == sorted(keys), str(keys[:4]))
+
+    # And the renderer must be a pure function of the topology it is handed.
+    topo4 = Topology(ordered)
+    m_a = mermaid.render_topology(topo4, flow.build_flow_model(topo4))
+    m_b = mermaid.render_topology(topo4, flow.build_flow_model(topo4))
+    c.check("rendering the same topology twice is byte-identical", m_a == m_b)
+
+    # ------------------------------------------------- incomplete inventory
+    print("\n[6d/8] incomplete inventory does not break the diagram")
+
+    # The shape that produced a hard crash in the field: a NAT gateway whose own
+    # subnet was never collected, while other subnets still route at it.
+    holedict = build_fixtures()
+    holedict["eu-west-1"]["describe_subnets"] = [
+        s for s in holedict["eu-west-1"]["describe_subnets"] if s["SubnetId"] != "subnet-pub-1"
+    ]
+    col5 = FixtureCollector(
+        holedict, cache_dir=None,
+        services=("ec2-workloads", "elbv2", "rds", "ecs", "eks", "lambda"),
+        pool_factory=lambda region: FakePool(region),
+    )
+    col5.start()
+    try:
+        topo5 = Topology([col5.collect_region(r) for r in holedict])
+        m5 = flow.build_flow_model(topo5)
+        t5 = mermaid.render_topology(topo5, m5)
+        c.check("a NAT whose subnet was not collected still renders", True)
+        c.check("the unresolved NAT is labelled rather than silently dropped",
+                "OFF DIAGRAM" in t5)
+        d5 = set(re.findall(r"^\s*(n\d+)[\[({]", t5, re.M))
+        a5 = set()
+        for line in t5.splitlines():
+            mm = re.match(r"^\s*(n\d+)\s*-->\|?[^|]*\|?\s*(n\d+)", line)
+            if mm:
+                a5.update(mm.groups())
+        c.check("no arrow points at an undeclared node with a hole in the inventory",
+                a5 <= d5, f"missing={sorted(a5 - d5)}")
+        c.check("the arrows into the unresolved NAT survive",
+                any(e.dst == flow.nid("nat", "nat-prod") for e in m5.edges))
+    except Exception as exc:  # noqa: BLE001
+        c.check("a NAT whose subnet was not collected still renders", False, repr(exc))
 
     print("\n[8/8] CLI entry point")
     from .cli import main
