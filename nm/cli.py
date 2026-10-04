@@ -236,22 +236,30 @@ def finish(snapshots: Sequence[AccountSnapshot], out_dir: str, logger: Logger, a
     }
 
     diagram_index: List[str] = []
+    flow_model = None
     if not args.no_diagrams:
-        diagram_index = write_diagrams(topo, findings, out_dir, args, logger)
+        diagram_index, flow_model = write_diagrams(topo, findings, out_dir, args, logger)
         report.write_text(os.path.join(out_dir, "START-HERE.md"), report.start_here_markdown(topo, findings, diagram_index))
     if args.reports:
         write_reports(topo, findings, cross_rows, lb_rows, exposure, cidr_rows, meta, out_dir, logger)
 
-    print_summary(topo, findings, cross_rows, lb_rows, exposure, out_dir, diagram_index, args)
+    print_summary(
+        topo, findings, cross_rows, lb_rows, exposure, out_dir, diagram_index, args,
+        flow_model,
+    )
     return 0
 
 
-def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger) -> List[str]:
+def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger):
     """Write exactly ONE topology diagram for the whole account.
 
     There is deliberately no per-VPC, per-AZ, per-subnet, "security" or
     "routing" companion diagram: containers carry location, arrows carry traffic
     paths, and security controls ride along as label metadata.
+
+    Returns ``(written_names, flow_model)``. The diagram itself stays pure
+    architecture -- no totals, no summary node -- so the numbers the model holds
+    are reported on the console instead, here.
     """
     model = flow.build_flow_model(topo)
     content = mermaid.render_topology(
@@ -262,12 +270,12 @@ def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger)
     )
     name = "00-network-topology.mmd"
     report.write_text(os.path.join(out_dir, name), content)
-    written = [name]
     logger(
         f"diagram: {name} ({len(model.edges)} network paths, "
-        f"{model.traced} traced / {model.blocked} SG-blocked workload paths)"
+        f"{model.traced} allowed / {model.blocked} blocked / "
+        f"{model.conditional} unknown workload paths)"
     )
-    return written
+    return [name], model
 
 
 def write_reports(
@@ -322,6 +330,7 @@ def print_summary(
     out_dir: str,
     diagram_index,
     args,
+    flow_model=None,
 ) -> None:
     summary = topo.summary()
     print()
@@ -335,6 +344,23 @@ def print_summary(
             if k not in ("regions", "collection_errors") and v
         )
     )
+    # The diagram is pure architecture, so the connectivity totals that describe
+    # it are printed here rather than drawn inside it.
+    if flow_model is not None:
+        routing = flow_model.routing
+        pub = sum(1 for r in routing.values() if r.classification == flow.PUBLIC)
+        priv = sum(1 for r in routing.values() if r.classification == flow.PRIVATE)
+        iso = len(routing) - pub - priv
+        print(
+            f"  topology: {len(topo.vpcs)} VPC(s), {len(routing)} subnet(s) "
+            f"({pub} public / {priv} private / {iso} isolated)"
+        )
+        print(
+            f"  paths drawn: {len(flow_model.edges)} network path(s); workload paths "
+            f"{flow_model.traced} allowed / {flow_model.blocked} blocked / "
+            f"{flow_model.conditional} unknown"
+        )
+
     blocked = [r for r in cross_rows if r.forward != "reachable"]
     if cross_rows:
         print(f"  cross-VPC links evaluated: {len(cross_rows)}  not fully reachable: {len(blocked)}")

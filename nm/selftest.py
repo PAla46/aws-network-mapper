@@ -864,6 +864,21 @@ def run_self_test(verbose: bool = True) -> int:
     m_b = mermaid.render_topology(topo4, flow.build_flow_model(topo4))
     c.check("rendering the same topology twice is byte-identical", m_a == m_b)
 
+    # The .mmd is a pure architecture diagram. Totals belong on the console, so
+    # nothing that is not a container, a node or an arrow may appear once the
+    # %% comments are stripped out.
+    body = [ln for ln in m_a.splitlines() if not ln.strip().startswith("%%")]
+    joined = "\n".join(body)
+    for token in ("CONNECTIVITY SUMMARY", "network path(s)", "paths drawn",
+                  "allowed /", "SUMMARY"):
+        c.check(f"the diagram carries no summary text ({token!r})",
+                token not in joined,
+                [ln for ln in body if token in ln][:2])
+    c.check("no summary subgraph in the diagram",
+            "subgraph" not in joined or "SUMMARY" not in joined)
+    c.check("the diagram still explains itself in comments",
+            "%% ---- how to read this ----" in m_a)
+
     # ------------------------------------------------- incomplete inventory
     print("\n[6d/8] incomplete inventory does not break the diagram")
 

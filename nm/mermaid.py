@@ -43,7 +43,6 @@ CLASSES = {
     "blocked": ("fill:#fee2e2,stroke:#b91c1c,color:#450a0a",),
     "warn": ("stroke-dasharray:4 3",),
     "component": ("fill:#e2e8f0,stroke:#334155,color:#0f172a",),
-    "summary": ("fill:#f8fafc,stroke:#0f172a,color:#0f172a",),
 }
 
 SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -761,42 +760,22 @@ def _orphan_notes(b, topo) -> None:
 
 
 def _legend(b, topo, model, vpc_count: int) -> None:
-    pub = sum(1 for r in model.routing.values() if r.classification == flow.PUBLIC)
-    priv = sum(1 for r in model.routing.values() if r.classification == flow.PRIVATE)
-    iso = len(model.routing) - pub - priv
-    b.free("  %% ---- legend ----")
-    b.free(f"  %% account {topo.account_id or 'n/a'} | {vpc_count} VPC(s) | "
-           f"{len(model.routing)} subnets: {pub} public / {priv} private / {iso} isolated")
-    b.free(f"  %% network paths drawn: {len(model.edges)} | "
-           f"workload paths traced: {model.traced} | SG-blocked: {model.blocked} | "
-           f"SG-conditional: {model.conditional}")
+    """Reading notes for whoever opens the .mmd file.
+
+    Every line below is a Mermaid ``%%`` comment, so it renders as nothing at all.
+    The picture itself carries no summary, no totals and no report -- it is only
+    containers and arrows. The numbers live in the console output instead.
+    """
+    b.free("  %% ---- how to read this ----")
     b.free("  %% containers: AWS ACCOUNT > VPC > AVAILABILITY ZONE > SUBNET (where things live)")
     b.free("  %% solid arrow = network traffic path; label = the route / port that creates it")
+    b.free("  %% arrow labels name the route only, never the node they point at")
+    b.free("  %% each journey is drawn once, in the direction traffic travels")
+    b.free("  %% 'security:' on a path edge is allowed / blocked / unknown")
     b.free("  %% 'local' is shown in an edge label only, never as a gateway node")
     b.free("  %% NACL appears in the subnet header; security groups in the resource node")
     b.free("  %% routes show configured reachability potential, not observed traffic")
-    _connectivity_summary(b, topo, model, vpc_count)
+    b.free(f"  %% {vpc_count} VPC(s), {len(model.routing)} subnets, {len(model.edges)} "
+           f"paths ({model.traced} allowed / {model.blocked} blocked / "
+           f"{model.conditional} unknown) -- console output has the detail")
     _orphan_notes(b, topo)
-
-
-def _connectivity_summary(b, topo: Topology, model: "flow.FlowModel", vpc_count: int) -> None:
-    """A visible summary of what the map concluded.
-
-    Section 29. The ``%%`` legend above is invisible in the rendered image, so the
-    headline numbers get a real node: one place that states how much was drawn
-    and how much of it security allows, without the reader counting arrows.
-    """
-    regions = sorted({s.region for s in topo.subnets.values() if s.region})
-    lines = [
-        "CONNECTIVITY SUMMARY",
-        f"account {topo.account_id or 'n/a'} · {vpc_count} VPC(s) · "
-        f"{len(model.routing)} subnets",
-        f"regions: {', '.join(regions) if regions else 'n/a'}",
-        f"{len(model.edges)} network path(s) drawn",
-        f"workload paths — {model.traced} allowed / {model.blocked} blocked / "
-        f"{model.conditional} unknown",
-        "'unknown' = rules could not be fully evaluated",
-        "containers = where things live, arrows = configured paths",
-    ]
-    with b.subgraph("connectivity-summary", "SUMMARY"):
-        b.node("n_summary", "\n".join(lines), "box", "summary", 300)

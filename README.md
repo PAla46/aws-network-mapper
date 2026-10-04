@@ -46,9 +46,14 @@ The diagram is Mermaid text. Paste it into <https://mermaid.live>.
 
 ## The topology diagram
 
-`00-network-topology.mmd` is the point of the tool. It answers, in one picture:
+`00-network-topology.mdd` is the point of the tool. It answers, in one picture:
 where things live, how traffic leaves them, which route is used, what the next
 hop is, and where the traffic ends up.
+
+The file is **pure architecture**: containers, nodes and arrows, nothing else. No
+totals, no summary box, no report text. Counts are printed to the console
+instead, so the picture never competes with its own statistics. The `.mmd` does
+carry `%%` comment lines explaining how to read it — those render as nothing.
 
 ### Two visual languages, never mixed
 
