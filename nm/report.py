@@ -391,9 +391,10 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
         "| --- | --- |",
     ]
     described = {
-        "00-overview.mmd": "every VPC, transit gateway attachment, peering, internet gateway and on-prem VPN",
-        "01-transit-gateways.mmd": "transit gateway attachments, their route tables and associations",
-        "02-internet-paths.mmd": "internet gateways, NAT gateways, public subnets and elastic IPs",
+        "00-data-flow.mmd": "the whole account as one chain: internet, gateways, subnets, workloads, ENIs, SGs and ports",
+        "01-overview.mmd": "every VPC, transit gateway attachment, peering, internet gateway and on-prem VPN",
+        "02-transit-gateways.mmd": "transit gateway attachments, their route tables and associations",
+        "03-internet-paths.mmd": "internet gateways, NAT gateways, public subnets and elastic IPs",
     }
     vpc_files = [d for d in diagrams if d.startswith("vpcs/")]
     sub_files = [d for d in diagrams if d.startswith("subnets/")]
@@ -401,7 +402,10 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
         if not name.startswith(("vpcs/", "subnets/")):
             lines.append(f"| `{name}` | {described.get(name, 'topology')} |")
     if vpc_files:
-        lines.append(f"| `vpcs/` ({len(vpc_files)}) | one file per VPC: subnets, route tables, gateways, workloads |")
+        lines.append(
+            f"| `vpcs/*-flow.mmd` | one layered flow diagram per VPC (same shape as the account-level one) |"
+        )
+        lines.append(f"| `vpcs/` ({len(vpc_files)}) | per VPC: subnets, route tables, gateways, workloads |")
     if sub_files:
         lines.append(f"| `subnets/` ({len(sub_files)}) | one file per subnet: route table, gateways, workloads |")
     if not vpc_files and not sub_files:

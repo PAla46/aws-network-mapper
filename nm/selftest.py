@@ -72,7 +72,7 @@ def _invalid_styles(diagrams: Dict[str, str]) -> List[str]:
     """Link tokens in every diagram that Mermaid would not accept."""
     bad: List[str] = []
     token = re.compile(
-        "<-\.->|<-\.\.->|<-->|-\.\.->|-\.->|-\.-|-->|==>|===|<==>|---|==|->"
+        r"<-\.->|<-\.\.->|<-->|-\.\.->|-\.->|-\.-|-->|==>|===|<==>|---|==|->"
     )
     for name, text in diagrams.items():
         for raw in text.splitlines():
@@ -370,6 +370,8 @@ def run_self_test(verbose: bool = True) -> int:
         "vpc-prod": mermaid.render_vpc(topo, "vpc-prod"),
         "vpc-dev": mermaid.render_vpc(topo, "vpc-dev"),
         "subnet-app-1": mermaid.render_subnet(topo, "subnet-app-1"),
+        "flow-vpc-prod": mermaid.render_flow(topo, "vpc-prod"),
+        "flow-account": mermaid.render_flow(topo),
         "connectivity": mermaid.render_connectivity(topo, [cross[0]] if cross else []),
     }
     tricky = mermaid.MermaidBuilder("escaping", "TB")
@@ -406,6 +408,29 @@ def run_self_test(verbose: bool = True) -> int:
     c.check("the link checker catches the reported bad styles",
             any("'->'" in x for x in caught) and any("'-.-'" in x for x in caught), str(caught))
     c.check("the link checker passes valid styles", not _invalid_styles({"ok": broken["ok"]}))
+
+    # The flow diagram is the primary artifact: check it carries the layered chain,
+    # not merely that it parses.
+    flow = diagrams["flow-vpc-prod"]
+    for needle, label in (
+        ("INTERNET", "internet origin"),
+        ("Internet Gateway", "internet gateway"),
+        ("public subnets", "public subnet tier"),
+        ("private subnets", "private subnet tier"),
+        ("data subnets", "data subnet tier"),
+        ("ENI ", "network interface layer"),
+        ("SG ", "security group layer"),
+        ("ingress ", "ingress port layer"),
+        (":8080", "load balancer target port"),
+        ("rt: ", "route table association on the subnet"),
+    ):
+        c.check(f"flow diagram shows the {label}", needle in flow)
+    c.check(
+        "flow diagram chains internet -> igw -> public subnet",
+        re.search(r"-->\|HTTPS/80/443\|.*-->\|routes here\|", flow, re.S) is not None,
+        flow[:400],
+    )
+    c.check("flow diagram groups subnets by tier", flow.count("subgraph") >= 3)
 
     # ---------------------------------------------------------------- reports
     print("\n[7/8] CSV / JSON / Markdown output")
@@ -474,7 +499,13 @@ def run_self_test(verbose: bool = True) -> int:
         c.eq("demo run exits 0", rc, 0)
 
         # Default output is diagrams only. Reports are opt-in via --reports.
-        for name in ("START-HERE.md", "00-overview.mmd", "01-transit-gateways.mmd", "02-internet-paths.mmd"):
+        for name in (
+            "START-HERE.md",
+            "00-data-flow.mmd",
+            "01-overview.mmd",
+            "02-transit-gateways.mmd",
+            "03-internet-paths.mmd",
+        ):
             c.check(f"default output has {name}", os.path.exists(os.path.join(out, name)))
         for name in ("report.md", "inventory.json", "findings", "reports"):
             c.check(
@@ -483,12 +514,17 @@ def run_self_test(verbose: bool = True) -> int:
             )
         c.check(
             "default output is small",
-            len([f for f in os.listdir(out) if f.endswith(".mmd")]) == 3,
+            len([f for f in os.listdir(out) if f.endswith(".mmd")]) == 4,
             str(sorted(os.listdir(out))),
         )
+        vpc_dir = os.path.join(out, "vpcs")
         c.check(
-            "per-VPC diagrams written",
-            any(f.startswith("eu-west-1-") for f in os.listdir(os.path.join(out, "vpcs"))),
+            "per-VPC flow diagrams written",
+            any(f.endswith("-flow.mmd") for f in os.listdir(vpc_dir)),
+        )
+        c.check(
+            "per-VPC detail diagrams written",
+            any(f.endswith("-flow.mmd") is False and f.endswith(".mmd") for f in os.listdir(vpc_dir)),
         )
         c.check(
             "no per-subnet diagrams without --deep",

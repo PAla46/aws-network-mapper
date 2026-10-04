@@ -626,3 +626,254 @@ def render_connectivity(topo, paths: Sequence) -> str:
         )
         b.node(key, f"{verdict.upper()}\n{trunc(hops, 90)}", "box", cls)
     return b.render()
+
+
+# --------------------------------------------------------------------------- #
+# layered data-flow diagram
+# --------------------------------------------------------------------------- #
+
+# Each layer is drawn as a subgraph so the vertical order in the picture is the
+# order a packet takes: internet, then edge gateways, then VPC tiers, then the
+# compute, then the network cards and the rules that admit or drop traffic.
+FLOW_ORDER = (
+    "internet",
+    "edge",
+    "tgw",
+    "peering",
+    "vpc-public",
+    "vpc-private",
+    "vpc-data",
+    "compute",
+    "rules",
+)
+
+FLOW_LABELS = {
+    "internet": "Internet / on-premises",
+    "edge": "Edge gateways (IGW, NAT, VGW)",
+    "tgw": "Transit gateways and peerings",
+    "peering": "VPC peering",
+    "vpc-public": "Public subnets",
+    "vpc-private": "Private subnets",
+    "vpc-data": "Data subnets",
+    "compute": "Workloads (EC2, ALB, RDS, ECS, EKS, Lambda)",
+    "rules": "Network interfaces, security groups, NACLs",
+}
+
+
+def _sg_ingress_summary(topo: Topology, sg_ids: Sequence[str], limit: int = 3) -> List[str]:
+    """Human-readable ingress rules, the thing that decides if a flow is allowed."""
+    out: List[str] = []
+    for sg_id in sg_ids:
+        sg = topo.security_groups.get(sg_id)
+        if not sg:
+            continue
+        name = sg.name or sg.id
+        for rule in sg.ingress[:limit]:
+            src = rule.cidr or (f"sg {rule.sg_id}" if rule.sg_id else "any")
+            proto = rule.protocol.upper() if rule.protocol not in ("-1", "all") else "any"
+            out.append(f"{name}: {proto} {rule.port_range} from {src}")
+        if len(sg.ingress) > limit:
+            out.append(f"{name}: +{len(sg.ingress) - limit} more")
+    return out
+
+
+def render_flow(topo: Topology, vpc_id: str = "", max_targets: int = 12) -> str:
+    """One layered diagram: internet -> gateways -> subnets -> workloads -> rules.
+
+    This is the "single interconnected" view. Subnets become subgraphs so the
+    tiers line up vertically, and every edge is a real configured route or a real
+    load balancer target rather than a generic association.
+    """
+    vpcs = [topo.vpcs[vpc_id]] if vpc_id and vpc_id in topo.vpcs else sorted(
+        topo.vpcs.values(), key=lambda v: (v.region, v.id)
+    )
+    title = f"Data flow: {topo.vpcs[vpc_id].label}" if vpc_id and vpc_id in topo.vpcs else "Data flow: whole account"
+    b = MermaidBuilder(title, "TB")
+
+    b.node("internet", "INTERNET\n/ on-premises / DX", "stadium", "internet")
+
+    for vpc in vpcs:
+        igw = topo.igw_for_vpc(vpc.id)
+        nat_gws = topo.nat_by_vpc.get(vpc.id, [])
+        vgws = [g for g in topo.vpn_gateways.values() if g.vpc_id == vpc.id]
+
+        # -- edge gateways ------------------------------------------------
+        if igw:
+            b.node(f"igw:{igw.id}", f"Internet Gateway\n{igw.name}\n{vpc.cidr}", "stadium", "igw")
+            b.edge("internet", f"igw:{igw.id}", "HTTPS/80/443", "-->")
+        for nat in nat_gws:
+            b.node(f"nat:{nat.id}", f"NAT Gateway\n{nat.state}\n{nat.connect_type}", "stadium", "nat")
+            b.edge(f"nat:{nat.id}", "internet", "egress", "-.->")
+            if igw:
+                b.edge(f"nat:{nat.id}", f"igw:{igw.id}", "via", "-.->")
+        for vgw in vgws:
+            b.node(f"vgw:{vgw.id}", f"VPN Gateway\n{vgw.state}", "stadium", "onprem")
+            b.edge("internet", f"vgw:{vgw.id}", "VPN", "-->")
+
+        # -- transit / peering -------------------------------------------
+        for att in topo.tgw_attachments_for_vpc(vpc.id):
+            tgw = topo.tgws.get(att.tgw_id)
+            if not tgw:
+                continue
+            tkey = f"tgw:{tgw.id}"
+            if tkey not in b._ids:
+                b.node(tkey, f"Transit Gateway\n{tgw.label}\n{tgw.region}", "stadium", "tgw")
+                b.edge(tkey, "internet", "via TGW", "-.->")
+            b.node(
+                f"tgwatt:{att.id}",
+                f"TGW attachment\n{', '.join(att.cidr_blocks) or vpc.cidr}\n{att.state}",
+                "stadium", "tgw",
+            )
+            b.edge(tkey, f"tgwatt:{att.id}", "attached", "-->")
+        for pcx in topo.peers_of_vpc(vpc.id):
+            peer = topo.vpcs.get(pcx.peer_vpc_id)
+            b.node(
+                f"pcx:{pcx.id}",
+                f"Peering -> {peer.label if peer else pcx.peer_vpc_id}\n{pcx.status}",
+                "hex", "peering" if pcx.status == "active" else "blocked",
+            )
+            b.edge("internet", f"pcx:{pcx.id}", "intra-region", "-.->")
+
+        # -- subnets, grouped by tier ------------------------------------
+        tiers: Dict[str, List[Subnet]] = {}
+        for subnet in topo.subnets_by_vpc.get(vpc.id, []):
+            tiers.setdefault(subnet_tier(subnet, topo.rtb_for_subnet(subnet.id)), []).append(subnet)
+
+        for tier in ("public", "private", "data"):
+            subnets = tiers.get(tier, [])
+            if not subnets:
+                continue
+            with b.subgraph(f"tier:{vpc.id}:{tier}", f"{vpc.label} / {tier} subnets"):
+                for subnet in subnets:
+                    rtb = topo.rtb_for_subnet(subnet.id)
+                    skey = f"sn:{subnet.id}"
+                    head = f"{subnet.name}\n{subnet.cidr}\n{subnet.az}"
+                    if rtb:
+                        head += f"\nrt: {rtb.name}"
+                    b.node(skey, head, "box", subnet_class(subnet, rtb))
+
+                    if igw and subnet_class(subnet, rtb) == "public":
+                        b.edge(f"igw:{igw.id}", skey, "routes here", "-->")
+                    if rtb:
+                        for nat in nat_gws:
+                            if subnet.id == nat.subnet_id:
+                                b.edge(skey, f"nat:{nat.id}", "default", "-.->")
+                        for dest in _tier_destinations(topo, vpc, subnet):
+                            if dest in b._ids:
+                                b.edge(skey, dest, "", "-->")
+
+        # -- compute, and the rules around it ---------------------------
+        # Nodes first, then wires: a subnet route to a workload needs the
+        # workload node to exist before the edge can reference it.
+        for wl in topo.workloads_by_vpc.get(vpc.id, []):
+            wkey = workload_key(wl)
+            if wkey in b._ids:
+                continue
+            anchor = next((f"sn:{s}" for s in wl.subnet_ids if f"sn:{s}" in b._ids), None)
+            lines = [f"{wl.kind.upper()} {wl.name or wl.id}"]
+            if wl.state:
+                lines.append(wl.state)
+            if wl.private_ips:
+                lines.append(", ".join(wl.private_ips[:2]))
+            b.node(wkey, "\n".join(lines), "round", _workload_class(wl))
+            if anchor:
+                b.edge(anchor, wkey, "hosts", "-->")
+            for target in (wl.extra.get("targets") or [])[:max_targets]:
+                tid = target.get("id")
+                port = target.get("port")
+                tgt = topo.workloads.get(tid) or next(
+                    (w for w in topo.workloads.values() if w.id == tid), None
+                )
+                if not tgt:
+                    continue
+                tkey_wl = workload_key(tgt)
+                if tkey_wl not in b._ids:
+                    tlines = [f"{tgt.kind.upper()} {tgt.name or tgt.id}"]
+                    if tgt.private_ips:
+                        tlines.append(", ".join(tgt.private_ips[:2]))
+                    b.node(tkey_wl, "\n".join(tlines), "round", _workload_class(tgt))
+                label = f":{port}" if port else "target"
+                health = target.get("health", "")
+                if health and health != "healthy":
+                    label += f" {health}"
+                b.edge(wkey, tkey_wl, label, "-->")
+
+        # Security groups and NACLs hang off the ENIs they belong to.
+        for wl in topo.workloads_by_vpc.get(vpc.id, []):
+            wkey = workload_key(wl)
+            for eni_id in wl.eni_ids:
+                eni = topo.enis.get(eni_id)
+                if not eni:
+                    continue
+                ekey = f"eni:{eni.id}"
+                elines = [f"ENI {eni.id}"]
+                if eni.private_ip:
+                    elines.append(eni.private_ip)
+                if eni.public_ip:
+                    elines.append(f"{eni.public_ip} (public)")
+                b.node(ekey, "\n".join(elines), "hex", "public" if eni.public_ip else "private")
+                b.edge(wkey, ekey, "on", "-.->")
+                for sg_id in eni.sg_ids:
+                    sg = topo.security_groups.get(sg_id)
+                    if not sg:
+                        continue
+                    gkey = f"sg:{sg.id}"
+                    if gkey not in b._ids:
+                        b.node(
+                            gkey,
+                            f"SG {sg.name or sg.id}\n{len(sg.ingress)} ingress / {len(sg.egress)} egress",
+                            "hex", "data",
+                        )
+                    b.edge(ekey, gkey, "uses", "-->")
+
+        # Ingress rules as explicit terminal nodes, so ports are visible.
+        _flow_rule_nodes(b, topo, vpc)
+
+    return b.render()
+
+
+def _flow_rule_nodes(b: MermaidBuilder, topo: Topology, vpc) -> None:
+    """Ingress ports as explicit nodes, and NACLs attached to their subnets."""
+    for sg in topo.sgs_by_vpc.get(vpc.id, []):
+        gkey = f"sg:{sg.id}"
+        if gkey not in b._ids:
+            continue
+        for line in _sg_ingress_summary(topo, [sg.id], limit=2):
+            rkey = f"r:{sg.id}:{abs(hash(line)) % 100000}"
+            b.node(rkey, f"ingress {line}", "box", "data")
+            b.edge(gkey, rkey, "allows", "-->")
+
+    # NACLs gate traffic at the subnet boundary, so hang them off the subnet.
+    for subnet in topo.subnets_by_vpc.get(vpc.id, []):
+        nacl = topo.nacl_by_subnet.get(subnet.id)
+        if not nacl:
+            continue
+        nkey = f"nacl:{nacl.id}"
+        if nkey not in b._ids:
+            b.node(
+                nkey,
+                f"NACL {nacl.name}\n{'default' if nacl.is_default else 'custom'}"
+                f"\n{len(nacl.entries)} entries",
+                "hex", "private" if nacl.is_default else "warn",
+            )
+        skey = f"sn:{subnet.id}"
+        if skey in b._ids:
+            b.edge(skey, nkey, "filtered by", "-.->")
+
+
+def _tier_destinations(topo: Topology, vpc, subnet: Subnet) -> List[str]:
+    """Where a subnet's own routes send traffic, for the arrows between tiers."""
+    rtb = topo.rtb_for_subnet(subnet.id)
+    if not rtb:
+        return []
+    out: List[str] = []
+    for route in rtb.routes:
+        if route.state != "active":
+            continue
+        if route.target_kind == M.T_TGW:
+            out.append(f"tgw:{route.target_id}")
+        elif route.target_kind == M.T_PEERING:
+            out.append(f"pcx:{route.target_id}")
+        elif route.target_kind == M.T_ENDPOINT:
+            out.append(f"ep:{route.target_id}")
+    return list(dict.fromkeys(out))[:4]
