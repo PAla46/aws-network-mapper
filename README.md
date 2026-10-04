@@ -13,23 +13,21 @@ anything.
 
 ## What it produces
 
-Default output is diagrams only:
+Default output is **one diagram**, plus an index:
 
 ```
 <out>/
-  START-HERE.md              what to open first, and every finding in a table
-  00-data-flow.mmd           THE one to read: internet -> gateways -> subnets
-                             -> workloads -> ENIs -> security groups -> ports
-  01-overview.mmd            all VPCs, TGWs, peerings, IGWs, on-prem, internet
-  02-transit-gateways.mmd    attachments, TGW route tables, associations
-  03-internet-paths.mmd      IGWs, NAT gateways, public subnets, EIPs
-  vpcs/<region>-<name>-<id>-flow.mmd   layered flow for one VPC
-  vpcs/<region>-<name>-<id>.mmd        same VPC as a reference diagram
+  START-HERE.md          how to read the diagram, plus every finding in a table
+  00-network-topology.mmd  THE diagram: the whole account, one picture
   logs/run.log
 ```
 
-Add `--deep` for a per-subnet file under `subnets/`, or `--reports` for the
-CSV/Markdown evidence set:
+There is deliberately no second diagram. No separate network / security view, no
+separate routing / resource view, no simplified and detailed pair, and nothing
+per VPC, per AZ or per subnet. Location and traffic paths share one picture
+because splitting them is what made the old output read like an inventory.
+
+Add `--reports` for the CSV/Markdown evidence set:
 
 ```
   report.md                  summary
@@ -44,38 +42,148 @@ CSV/Markdown evidence set:
   .cache/                    raw API responses, for offline rebuilds
 ```
 
-Each `.mmd` file is Mermaid text. Paste one into <https://mermaid.live>, or render:
+The diagram is Mermaid text. Paste it into <https://mermaid.live>.
 
-```bash
-npx -y @mermaid-js/mermaid-cli -i 00-data-flow.mmd -o flow.svg
+## The topology diagram
+
+`00-network-topology.mmd` is the point of the tool. It answers, in one picture:
+where things live, how traffic leaves them, which route is used, what the next
+hop is, and where the traffic ends up.
+
+### Two visual languages, never mixed
+
+**Containers are location.** They nest:
+
+```
+AWS Account > VPC > Availability Zone > Subnet > resources
 ```
 
-## The data-flow diagram
+A subnet container tells you *where* a resource lives. Each subnet header also
+carries its id, CIDR, AZ, associated route table, NACL, and classification.
 
-`00-data-flow.mmd` is the point of the tool. It lays the network out in the order
-a packet crosses it, so you can read it top to bottom:
+**Arrows are traffic paths.** Every arrow is labelled with the route that
+justifies it, so you can look at any line and know why it exists:
+
+```
+0.0.0.0/0 → Internet Gateway
+0.0.0.0/0 → NAT Gateway
+10.30.0.0/16 → Transit Gateway
+172.16.0.0/16 → VPC Peering
+TCP :8080
+TCP :5432
+via 10.0.0.0/16 local
+```
+
+### Reading a path
 
 ```
 INTERNET
-  |  HTTPS/80/443
-Internet Gateway
-  |  routes here
-public subnet          (route table named on the node)
-  |  hosts
-ALB / EC2
-  |  :8080             (load balancer target port)
-EC2 target
+  |  0.0.0.0/0 → Internet Gateway
+  v
+Internet Gateway  --(inbound to 10.0.1.0/24)-->
+  v
+PUBLIC SUBNET 10.0.1.0/24          <- where the ALB lives
   |
-ENI                    (private and public IPs)
-  |  uses
-Security group
-  |  allows
-ingress TCP 8080 from sg sg-alb
+  |  TCP :443
+  v
+ALB
+  |  TCP :8080   via 10.0.0.0/16 local
+  v
+PRIVATE SUBNET 10.0.10.0/24        <- where the app server lives
+  |
+  |  TCP :5432   via 10.0.0.0/16 local
+  v
+ISOLATED SUBNET 10.0.20.0/24       <- where the database lives
+  |
+  v
+RDS PostgreSQL
 ```
 
-Subnets are grouped into public / private / data tiers, and every arrow is a real
-configured route, a real load balancer target, or a real security group rule,
-not a generic association. Per-VPC versions of the same diagram are under `vpcs/`.
+And independently, the egress story for the same private subnet:
+
+```
+EC2
+  v
+PRIVATE SUBNET
+  |  0.0.0.0/0 → NAT Gateway
+  v
+NAT Gateway (public, eu-west-1a / 10.0.1.0/24)
+  |  via public subnet
+  v
+Internet Gateway
+  v
+INTERNET
+```
+
+### What is deliberately *not* a node
+
+The old diagram drew generic association arrows such as `Subnet --filtered by-->
+NACL`. Traffic does not travel through a NACL or a security group, so those are
+not nodes here:
+
+| Concept | Role | Where it appears |
+| --- | --- | --- |
+| Subnet | where the resource lives | container, with id/CIDR/AZ/route table/NACL |
+| Route table | where traffic goes next | on the subnet header, and as the label on each arrow |
+| IGW / NAT / TGW / peering / VGW / VPN | how networks connect | nodes on the traffic path |
+| NACL | subnet-level filtering | `NACL: acl-...  4 in / 2 out` in the subnet header |
+| Security group | ENI-level filtering | `SG: sg-...` plus inbound rules in the resource node |
+| Resource | where traffic terminates | node inside its subnet |
+
+`local` is not drawn as a "Local Gateway" either. `10.0.0.0/16 → local` is
+intra-VPC routing, so it appears in an *arrow label* and the arrow runs straight
+from the source resource to the destination resource across the subnet
+containers that contain them.
+
+### Subnet classification comes from routing
+
+Not from the subnet name. The tool reads the subnet's effective route table:
+
+| Classification | Derived from |
+| --- | --- |
+| `PUBLIC` | `0.0.0.0/0` targets an Internet Gateway |
+| `PRIVATE` | `0.0.0.0/0` targets a NAT Gateway (or leaves via TGW/VGW) |
+| `ISOLATED` | no `0.0.0.0/0` route at all |
+
+Each subnet header states the route that proves its classification, e.g.
+`Type: ISOLATED — no 0.0.0.0/0 route in its route table`.
+
+### Longest-prefix match
+
+Route selection follows AWS behaviour: the most specific applicable route wins,
+via `cidrutil.longest_prefix_match`. `nm/paths.py:PathEngine.resolve()` walks the
+route table, resolves the next hop (IGW, NAT, TGW, peering, VGW, VPC endpoint),
+and records the hops. `nm/flow.py` reuses that engine rather than re-deriving
+routing, so the diagram and the `--reports` cross-VPC CSV cannot disagree.
+
+### No invented connectivity
+
+An arrow is only drawn when real configuration supports it:
+
+- a route in a real route table, resolved by longest-prefix match
+- a registered load balancer target, at its real target-group port
+- a Transit Gateway route table entry that actually delivers into an attached
+  VPC, resolved further through *that* VPC's own route table
+- a VPC peering that some route table actually points at
+
+Arrows show **configured reachability**, not observed traffic. The diagram says
+"network path" and "route exists", never "application talks to". If a route
+exists but a security group blocks the port, the arrow stays and gains an
+`SG DENIES` annotation — the route is still a route, and the block is not turned
+into a fake hop.
+
+### Multi-AZ and multi-subnet resources
+
+Subnets are grouped into their own AZ container, so multi-AZ deployments are
+visible. A load balancer with ENIs in several subnets is drawn once and lists
+its placement, because duplicating the node would imply several load balancers.
+
+### Large accounts
+
+`--max-diagram-vpcs` (default 60) and `--max-diagram-subnets` (default 200 per
+VPC) bound the drawing. Security resources that attach to nothing have no place
+in a topology, so they are recorded as `%%` comments at the end of the file
+rather than being silently dropped.
 
 ## Running it in CloudShell
 
@@ -214,9 +322,11 @@ nm/model.py              normalized resource model and API parsing
 nm/collect.py            concurrent cached collection
 nm/topology.py           indexes, subnet to route table resolution
 nm/paths.py              route, gateway, peering and security group path evaluation
+nm/flow.py               normalized connectivity model: subnet classification,
+                         route arrows, workload arrows (reuses paths.py)
 nm/analysis.py           cross-VPC, load balancer, exposure, CIDR analyses
 nm/findings.py           the rules above
-nm/mermaid.py            diagram builders
+nm/mermaid.py            the single topology diagram renderer
 nm/report.py             CSV, JSON and Markdown writers
 nm/cli.py                argument parsing and orchestration
 nm/fixtures.py           synthetic scenario

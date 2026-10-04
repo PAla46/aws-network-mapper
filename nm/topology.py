@@ -119,6 +119,40 @@ class Topology:
     def _link(self) -> None:
         for subnet in self.subnets.values():
             self.nacl_by_subnet[subnet.id] = self.default_nacl_for(subnet)
+        self._link_database_enis()
+
+    def _link_database_enis(self) -> None:
+        """Attach RDS ENIs to their instance.
+
+        ``describe_db_instances`` never returns the interface, and the endpoint
+        address is a DNS name rather than an address you can route to. AWS does
+        expose the ENI through ``describe_network_interfaces``, named
+        ``RDSNetworkInterface`` / ``RDSNetworkInterface:<name>``, and the subnet
+        group tells us which VPC it lives in. Without this the diagram cannot
+        show an EC2 -> RDS path at all, because there is no IP to trace.
+        """
+        for wl in self.workloads.values():
+            if wl.kind != "rds" or wl.eni_ids:
+                continue
+            candidates = [
+                eni
+                for eni in self.enis.values()
+                if eni.subnet_id in (wl.subnet_ids or [])
+                and "rds" in (eni.description or "").lower()
+                and not eni.instance_id
+            ]
+            if not candidates:
+                continue
+            # Prefer an interface whose description names this instance.
+            named = [e for e in candidates if wl.name and wl.name in (e.description or "")]
+            chosen = (named or candidates)[0]
+            wl.eni_ids = [chosen.id]
+            if not wl.private_ips or "." not in (wl.private_ips[0] or ""):
+                if chosen.private_ip:
+                    wl.private_ips = [chosen.private_ip]
+            if not wl.sg_ids:
+                wl.sg_ids = list(chosen.sg_ids)
+            chosen.requester_managed = True
 
     # -- lookups ---------------------------------------------------------
     def vpc_of_subnet(self, subnet_id: str) -> Optional[Vpc]:

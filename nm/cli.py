@@ -10,7 +10,7 @@ import time
 import traceback
 from typing import Dict, List, Optional, Sequence
 
-from . import analysis, mermaid, report
+from . import analysis, flow, mermaid, report
 from .collect import Collector, CollectorError
 from .findings import Finding, run_rules
 from .model import AccountSnapshot
@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  aws-network-mapper.py --regions eu-west-1,us-east-1 --out ./map\n"
-            "  aws-network-mapper.py --all-regions --deep\n"
+            "  aws-network-mapper.py --all-regions\n"
             "  aws-network-mapper.py --offline --cache-dir ./map/.cache --out ./map2\n"
             "  aws-network-mapper.py --demo --out ./demo     # no AWS calls at all\n"
         ),
@@ -78,12 +78,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--deep",
         action="store_true",
-        help="evaluate extra flows (per-subnet drill-down diagrams, extra cross-VPC pairs)",
+        help="evaluate extra flows (more cross-VPC pairs) for the reports",
     )
     parser.add_argument("--max-vpc-pairs", type=int, default=500, help="cap on cross-VPC evaluations")
-    parser.add_argument("--max-diagram-subnets", type=int, default=40, help="subnets drawn per VPC")
-    parser.add_argument("--max-diagram-vpcs", type=int, default=40, help="VPCs in the overview")
-    parser.add_argument("--max-drilldown", type=int, default=40, help="per-subnet diagrams to write")
+    parser.add_argument(
+        "--max-diagram-subnets",
+        type=int,
+        default=200,
+        help="subnets drawn per VPC in the topology diagram",
+    )
+    parser.add_argument(
+        "--max-diagram-vpcs",
+        type=int,
+        default=60,
+        help="VPCs drawn in the topology diagram",
+    )
     parser.add_argument("-q", "--quiet", action="store_true", help="less console output")
     parser.add_argument("--demo", action="store_true", help="run the bundled synthetic scenario")
     parser.add_argument("--self-test", action="store_true", help="run offline checks and exit")
@@ -236,52 +245,26 @@ def finish(snapshots: Sequence[AccountSnapshot], out_dir: str, logger: Logger, a
 
 
 def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger) -> List[str]:
-    written: List[str] = []
-    vpc_dir = report.ensure_dir(os.path.join(out_dir, "vpcs"))
-    subnet_dir = os.path.join(out_dir, "subnets")
+    """Write exactly ONE topology diagram for the whole account.
 
-    def save(name: str, content: str) -> None:
-        path = os.path.join(out_dir, name)
-        report.write_text(path, content)
-        written.append(name)
-
-    # The whole-account flow diagram is the one to open first.
-    save("00-data-flow.mmd", mermaid.render_flow(topo))
-    save("01-overview.mmd", mermaid.render_overview(topo, max_vpcs=args.max_diagram_vpcs))
-    save("02-transit-gateways.mmd", mermaid.render_tgw(topo))
-    save("03-internet-paths.mmd", mermaid.render_internet(topo))
-
-    for vpc in sorted(topo.vpcs.values(), key=lambda v: (v.region, v.id)):
-        base = f"{vpc.region}-{mermaid.slug(vpc.label)}-{vpc.id}"
-        report.write_text(
-            os.path.join(vpc_dir, f"{base}-flow.mmd"),
-            mermaid.render_flow(topo, vpc.id),
-        )
-        written.append(f"vpcs/{base}-flow.mmd")
-        report.write_text(
-            os.path.join(vpc_dir, f"{base}.mmd"),
-            mermaid.render_vpc(
-                topo,
-                vpc.id,
-                max_subnets=args.max_diagram_subnets,
-                max_workloads=args.max_diagram_subnets,
-            ),
-        )
-        written.append(f"vpcs/{base}.mmd")
-
-    # Per-subnet drill-downs are only useful when chasing a specific path.
-    interesting = set(topo.subnets) if args.deep else set()
-    for subnet_id in sorted(interesting)[: args.max_drilldown]:
-        if subnet_id not in topo.subnets:
-            continue
-        fname = f"{topo.subnets[subnet_id].region}-{mermaid.slug(topo.subnets[subnet_id].name)}-{subnet_id}.mmd"
-        report.ensure_dir(subnet_dir)
-        report.write_text(
-            os.path.join(subnet_dir, fname),
-            mermaid.render_subnet(topo, subnet_id),
-        )
-        written.append(f"subnets/{fname}")
-    logger(f"diagrams: {len(written)} file(s) under {out_dir}")
+    There is deliberately no per-VPC, per-AZ, per-subnet, "security" or
+    "routing" companion diagram: containers carry location, arrows carry traffic
+    paths, and security controls ride along as label metadata.
+    """
+    model = flow.build_flow_model(topo)
+    content = mermaid.render_topology(
+        topo,
+        model,
+        max_vpcs=args.max_diagram_vpcs,
+        max_subnets=args.max_diagram_subnets,
+    )
+    name = "00-network-topology.mmd"
+    report.write_text(os.path.join(out_dir, name), content)
+    written = [name]
+    logger(
+        f"diagram: {name} ({len(model.edges)} network paths, "
+        f"{model.traced} traced / {model.blocked} SG-blocked workload paths)"
+    )
     return written
 
 
@@ -380,15 +363,14 @@ def print_summary(
     print(f"Output: {os.path.abspath(out_dir)}")
     if diagram_index:
         print(f"  start at: {os.path.join(out_dir, 'START-HERE.md')}")
-        print(f"  overview: {os.path.join(out_dir, '00-overview.mmd')}")
-        print(f"  diagrams: {len(diagram_index)} .mmd files total")
+        print(f"  topology: {os.path.join(out_dir, diagram_index[0])}")
+        print("  (one diagram for the whole account: location + traffic paths)")
     if args.reports:
         print(f"  reports:  {os.path.join(out_dir, 'reports', 'routes.csv')} (+8 more)")
     else:
         print("  (add --reports for CSV/Markdown evidence)")
     print()
-    print("View a diagram: open https://mermaid.live and paste the .mmd text, or")
-    print("  npx -y @mermaid-js/mermaid-cli -i 00-overview.mmd -o overview.svg")
+    print("View it: open https://mermaid.live and paste the .mmd text.")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

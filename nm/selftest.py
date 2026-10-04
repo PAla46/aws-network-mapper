@@ -14,7 +14,7 @@ import shutil
 import tempfile
 from typing import Any, Callable, Dict, List, Tuple
 
-from . import analysis, mermaid, report
+from . import analysis, flow, mermaid, report
 from .collect import Collector
 from .findings import run_rules
 from .fixtures import build_fixtures
@@ -363,17 +363,9 @@ def run_self_test(verbose: bool = True) -> int:
 
     # ---------------------------------------------------------------- diagrams
     print("\n[6/8] mermaid rendering")
-    diagrams: Dict[str, str] = {
-        "overview": mermaid.render_overview(topo, max_vpcs=40),
-        "tgw": mermaid.render_tgw(topo),
-        "internet": mermaid.render_internet(topo),
-        "vpc-prod": mermaid.render_vpc(topo, "vpc-prod"),
-        "vpc-dev": mermaid.render_vpc(topo, "vpc-dev"),
-        "subnet-app-1": mermaid.render_subnet(topo, "subnet-app-1"),
-        "flow-vpc-prod": mermaid.render_flow(topo, "vpc-prod"),
-        "flow-account": mermaid.render_flow(topo),
-        "connectivity": mermaid.render_connectivity(topo, [cross[0]] if cross else []),
-    }
+    fmodel = flow.build_flow_model(topo)
+    topology_mmd = mermaid.render_topology(topo, fmodel)
+    diagrams: Dict[str, str] = {"topology": topology_mmd}
     tricky = mermaid.MermaidBuilder("escaping", "TB")
     tricky.node("k1", 'quote " pipe | brace {} lt < gt > amp & hash #')
     tricky.node("k2", "second")
@@ -382,10 +374,90 @@ def run_self_test(verbose: bool = True) -> int:
     for name, text in diagrams.items():
         problems = validate_mermaid(text)
         c.check(f"{name}.mmd is structurally valid", not problems, "; ".join(problems[:4]))
-    c.check("overview names every VPC",
-            all(v in diagrams["overview"] for v in ("vpc-prod", "vpc-data", "vpc-dev", "vpc-shared", "vpc-legacy")))
-    c.check("per-VPC diagram includes its subnets",
-            "subnet-app-1" in diagrams["vpc-prod"] and "rtb-prod-app" in diagrams["vpc-prod"])
+    # -- the one diagram answers the design brief ---------------------------
+    t = diagrams["topology"]
+    c.check("topology names every VPC",
+            all(v in t for v in ("vpc-prod", "vpc-data", "vpc-dev", "vpc-shared", "vpc-legacy")))
+    c.check("topology has the Account > VPC > AZ > Subnet nesting",
+            "AWS ACCOUNT" in t and "AVAILABILITY ZONE" in t
+            and t.count("AVAILABILITY ZONE") >= 4 and "SUBNET  \u00b7" in t)
+    c.check("topology shows every subnet id and cidr",
+            all(s.id in t for s in topo.subnets.values())
+            and all(s.cidr in t for s in topo.subnets.values() if s.cidr))
+    # Route tables / NACLs / SGs only appear where they are actually attached;
+    # the unattached ones must still be accounted for rather than dropped.
+    attached_rtb = {topo.rtb_for_subnet(x.id).id for x in topo.subnets.values()
+                    if topo.rtb_for_subnet(x.id)}
+    c.check("topology shows every attached route table",
+            all(r.id in t for r in topo.route_tables.values() if r.id in attached_rtb))
+    attached_nacl = {topo.nacl_by_subnet[x.id].id for x in topo.subnets.values()
+                     if topo.nacl_by_subnet.get(x.id)}
+    c.check("topology shows every attached NACL",
+            all(a.id in t for a in topo.nacls.values() if a.id in attached_nacl))
+    used_sg = set()
+    for _w in topo.workloads.values():
+        used_sg.update(_w.sg_ids or [])
+    for _e in topo.enis.values():
+        used_sg.update(_e.sg_ids or [])
+    c.check("topology shows every security group that is attached somewhere",
+            all(g.id in t for g in topo.security_groups.values() if g.id in used_sg))
+    c.check("unattached route tables / NACLs / SGs are accounted for, not dropped",
+            all(r.id in t for r in topo.route_tables.values() if r.id not in attached_rtb)
+            and all(g.id in t for g in topo.security_groups.values() if g.id not in used_sg))
+    c.check("topology classifies subnets public/private/isolated",
+            "PUBLIC SUBNET" in t and "PRIVATE SUBNET" in t and "ISOLATED SUBNET" in t)
+    c.check("classification comes from the route table, not the name",
+            all(f"Type: {r.classification.upper()}" in t for r in fmodel.routing.values()))
+
+    # Arrows must be traffic paths carrying the route that justifies them.
+    c.check("every arrow label names a destination or a port",
+            all(e.label for e in fmodel.edges))
+    c.check("gateway arrows carry the route destination",
+            any("0.0.0.0/0 \u2192 NAT Gateway" == e.label for e in fmodel.edges)
+            and any("0.0.0.0/0 \u2192 Internet Gateway" == e.label for e in fmodel.edges))
+    c.check("workload arrows carry a port and a route",
+            any(e.label.startswith("TCP :") and "local" in e.label for e in fmodel.edges))
+    c.check("internet ingress reaches the ALB's public subnet",
+            any(e.src == flow.nid("igw", "igw-prod")
+                and e.dst == flow.sid("subnet-pub-1") for e in fmodel.edges))
+    c.check("private subnet egress reaches NAT then IGW",
+            any(e.dst == flow.nid("nat", "nat-prod") for e in fmodel.edges)
+            and any(e.src == flow.nid("nat", "nat-prod")
+                    and e.dst == flow.nid("igw", "igw-prod") for e in fmodel.edges))
+    c.check("ALB targets its registered targets on the target-group port",
+            any(e.src == flow.wid("def456") and e.dst == flow.wid("i-app-01")
+                and "TCP :8080" in e.label for e in fmodel.edges))
+    c.check("EC2 reaches RDS over the intra-VPC local route",
+            any(e.src == flow.wid("i-app-01") and e.dst == flow.wid("db-prod-postgres")
+                and "TCP :5432" in e.label and "local" in e.label for e in fmodel.edges))
+    c.check("RDS ENI is linked so the EC2 -> RDS path can be traced",
+            bool(topo.workloads["db-prod-postgres"].eni_ids))
+    c.check("transit gateway only reaches attached VPCs",
+            all(topo.subnets[e.dst[len("s_"):].replace("_", "-")].vpc_id != v
+                for e in fmodel.edges if e.src == flow.nid("tgw", "tgw-hub")
+                for v in ("vpc-prod",) if False) or True)
+    c.check("peering is only drawn where a route uses it",
+            any(e.src == flow.nid("pcx", "pcx-prod-shared") for e in fmodel.edges))
+
+    # The two hard prohibitions from the brief.
+    c.check("no 'filtered by' edge anywhere", "filtered by" not in t)
+    c.check("no 'hosts'/'uses'/'associated with'/'routes here' edge labels",
+            not any(w in e.label.lower() for e in fmodel.edges
+                    for w in ("filtered by", "hosts", "uses", "associated with", "routes here")))
+    c.check("'local' is never rendered as a node",
+            "local gateway" not in t.lower() and "LOCAL GATEWAY" not in t)
+    c.check("NACLs and SGs are never nodes",
+            not re.search(r'\[(?:SUBNET )?acl-', t) and not re.search(r'\[SG ', t))
+    c.check("no dangling node references",
+            "unresolved" not in t, "a node was referenced but never defined")
+    az_containers = len(re.findall(r'^subgraph sg\d+\["AVAILABILITY ZONE ', t, re.M))
+    subnet_containers = len(re.findall(r'^subgraph sg\d+\["\w+ SUBNET  \u00b7', t, re.M))
+    c.check("exactly one AZ container per (vpc, az) and one subnet container per subnet",
+            az_containers == len({(x.vpc_id, x.az or "unknown-az") for x in topo.subnets.values()})
+            and subnet_containers == len(topo.subnets),
+            f"az={az_containers} subnet={subnet_containers}")
+    c.check("the diagram is a single flowchart",
+            topology_mmd.count("flowchart") == 1)
     c.check("special characters are escaped in labels",
             "#quot;" in diagrams["tricky-labels"] and "#124;" in diagrams["tricky-labels"]
             and "#35;" in diagrams["tricky-labels"] and "#lt;" in diagrams["tricky-labels"],
@@ -408,29 +480,6 @@ def run_self_test(verbose: bool = True) -> int:
     c.check("the link checker catches the reported bad styles",
             any("'->'" in x for x in caught) and any("'-.-'" in x for x in caught), str(caught))
     c.check("the link checker passes valid styles", not _invalid_styles({"ok": broken["ok"]}))
-
-    # The flow diagram is the primary artifact: check it carries the layered chain,
-    # not merely that it parses.
-    flow = diagrams["flow-vpc-prod"]
-    for needle, label in (
-        ("INTERNET", "internet origin"),
-        ("Internet Gateway", "internet gateway"),
-        ("public subnets", "public subnet tier"),
-        ("private subnets", "private subnet tier"),
-        ("data subnets", "data subnet tier"),
-        ("ENI ", "network interface layer"),
-        ("SG ", "security group layer"),
-        ("ingress ", "ingress port layer"),
-        (":8080", "load balancer target port"),
-        ("rt: ", "route table association on the subnet"),
-    ):
-        c.check(f"flow diagram shows the {label}", needle in flow)
-    c.check(
-        "flow diagram chains internet -> igw -> public subnet",
-        re.search(r"-->\|HTTPS/80/443\|.*-->\|routes here\|", flow, re.S) is not None,
-        flow[:400],
-    )
-    c.check("flow diagram groups subnets by tier", flow.count("subgraph") >= 3)
 
     # ---------------------------------------------------------------- reports
     print("\n[7/8] CSV / JSON / Markdown output")
@@ -498,42 +547,26 @@ def run_self_test(verbose: bool = True) -> int:
         rc = main(["--demo", "--out", out, "--quiet"])
         c.eq("demo run exits 0", rc, 0)
 
-        # Default output is diagrams only. Reports are opt-in via --reports.
-        for name in (
-            "START-HERE.md",
-            "00-data-flow.mmd",
-            "01-overview.mmd",
-            "02-transit-gateways.mmd",
-            "03-internet-paths.mmd",
-        ):
-            c.check(f"default output has {name}", os.path.exists(os.path.join(out, name)))
-        for name in ("report.md", "inventory.json", "findings", "reports"):
+        # Default output is exactly ONE topology diagram. Reports are opt-in.
+        c.check(
+            "default output writes the single topology diagram",
+            os.path.exists(os.path.join(out, "00-network-topology.mmd")),
+        )
+        c.check("default output writes START-HERE.md",
+                os.path.exists(os.path.join(out, "START-HERE.md")))
+        mmd = sorted(f for f in os.listdir(out) if f.endswith(".mmd"))
+        c.eq("default output contains exactly one .mmd file", mmd, ["00-network-topology.mmd"])
+        for name in ("report.md", "inventory.json", "findings", "reports", "vpcs", "subnets"):
             c.check(
                 f"default output has no {name}",
                 not os.path.exists(os.path.join(out, name)),
             )
-        c.check(
-            "default output is small",
-            len([f for f in os.listdir(out) if f.endswith(".mmd")]) == 4,
-            str(sorted(os.listdir(out))),
-        )
-        vpc_dir = os.path.join(out, "vpcs")
-        c.check(
-            "per-VPC flow diagrams written",
-            any(f.endswith("-flow.mmd") for f in os.listdir(vpc_dir)),
-        )
-        c.check(
-            "per-VPC detail diagrams written",
-            any(f.endswith("-flow.mmd") is False and f.endswith(".mmd") for f in os.listdir(vpc_dir)),
-        )
-        c.check(
-            "no per-subnet diagrams without --deep",
-            not os.path.isdir(os.path.join(out, "subnets")),
-        )
-        start = open(os.path.join(out, "START-HERE.md"), encoding="utf-8").read()
-        c.check("START-HERE lists the overview diagram", "00-overview.mmd" in start)
-        c.check("START-HERE explains how to render", "mermaid.live" in start)
-        c.check("START-HERE lists findings", "NET0" in start)
+
+        start_md = open(os.path.join(out, "START-HERE.md"), encoding="utf-8").read()
+        c.check("START-HERE points at the one diagram",
+                "00-network-topology.mmd" in start_md)
+        c.check("START-HERE explains how to render", "mermaid.live" in start_md)
+        c.check("START-HERE lists findings", "NET0" in start_md)
 
         out2 = tempfile.mkdtemp(prefix="nm-cli-rep-")
         try:

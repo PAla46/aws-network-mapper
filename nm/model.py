@@ -369,6 +369,7 @@ class NaclEntry:
     cidr: str
     port: str = ""
     icmp: str = ""
+    egress: bool = False
 
 
 @dataclass
@@ -656,6 +657,7 @@ def nacl_from(n: Dict[str, Any], region: str) -> Nacl:
                 if e.get("PortRange")
                 else "",
                 icmp=e.get("IcmpTypeCode", {}).get("Type", "") if e.get("IcmpTypeCode") else "",
+                egress=bool(e.get("Egress")),
             )
         )
     return Nacl(

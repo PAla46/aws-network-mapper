@@ -7,12 +7,10 @@ node ids and escapes labels, so generated files always parse.
 from __future__ import annotations
 
 import re
-from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from . import model as M
-from .cidrutil import is_default_route
-from .model import RouteTable, Subnet, Workload
+from . import flow, model as M
+from .model import Subnet, Workload
 from .topology import Topology
 
 ESCAPES = {
@@ -89,6 +87,7 @@ class MermaidBuilder:
         self._defined: Set[str] = set()
         self._edges: Set[str] = set()
         self._class_of: Dict[str, str] = {}
+        self._subgraph_counter = 0
 
     # -- nodes -----------------------------------------------------------
     def nid(self, key: str) -> str:
@@ -147,15 +146,11 @@ class MermaidBuilder:
         self.edge(src_key, dst_key, **kwargs)
 
     # -- subgraphs -------------------------------------------------------
-    @contextmanager
-    def subgraph(self, key: str, label: str):
-        sid = f"sg{abs(hash(key)) % 100000}"
-        self._lines.append(f'subgraph {sid}["{esc(label)}"]')
-        self._lines.append("  direction " + self.direction)
-        try:
-            yield sid
-        finally:
-            self._lines.append("end")
+    def subgraph(self, key: str, label: str) -> "_Subgraph":
+        return _Subgraph(self, key, label)
+
+    def defined(self, key: str) -> bool:
+        return key in self._ids and self._ids[key] in self._defined
 
     def free(self, line: str) -> None:
         self._lines.append(line)
@@ -175,489 +170,34 @@ class MermaidBuilder:
         return "\n".join(out) + "\n"
 
 
+class _Subgraph:
+    """Deterministic nested subgraph context manager.
+
+    Ids come from a counter rather than ``hash()`` so the same inventory always
+    renders byte-identical output (Python randomizes string hashes per process).
+    """
+
+    def __init__(self, builder: MermaidBuilder, key: str, label: str):
+        self.b = builder
+        self.key = key
+        self.label = label
+        self.id = ""
+
+    def __enter__(self) -> str:
+        self.b._subgraph_counter += 1
+        self.id = f"sg{self.b._subgraph_counter}"
+        self.b._lines.append(f'subgraph {self.id}["{esc(self.label)}"]')
+        self.b._lines.append("  direction " + self.b.direction)
+        return self.id
+
+    def __exit__(self, *exc) -> bool:
+        self.b._lines.append("end")
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # subnets / workloads
 # --------------------------------------------------------------------------- #
-
-
-def subnet_tier(subnet: Subnet, rtb: Optional[RouteTable]) -> str:
-    name = (subnet.name or "").lower()
-    if any(h in name for h in ("public", "dmz", "edge", "nat", "bastion", "elb")):
-        return "public"
-    if any(h in name for h in ("db", "data", "rds", "aurora")):
-        return "data"
-    return "private"
-
-
-def subnet_class(subnet: Subnet, rtb: Optional[RouteTable]) -> str:
-    tier = subnet_tier(subnet, rtb)
-    if rtb and any(
-        r.target_kind in (M.T_INTERNET, M.T_EIGW) and r.state == "active" for r in rtb.routes
-    ):
-        return "public"
-    return tier
-
-
-def workload_key(wl: Workload) -> str:
-    return f"wl:{wl.region}:{wl.id}"
-
-
-def workload_label(wl: Workload, max_targets: int = 0) -> str:
-    base = wl.label if wl.name else wl.id
-    lines = [f"{wl.kind.upper()} {base}"]
-    if wl.engine and wl.kind not in ("alb", "nlb", "gwlb"):
-        lines.append(wl.engine)
-    if wl.extra.get("scheme"):
-        lines.append(str(wl.extra["scheme"]))
-    if wl.state:
-        lines.append(wl.state)
-    if max_targets and wl.extra.get("targets"):
-        lines.append(f"{len(wl.extra['targets'])} targets")
-    return "\n".join(lines)
-
-
-def route_table_label(rtb: RouteTable, detail: bool = True) -> str:
-    if not detail:
-        return rtb.label
-    interesting = [
-        r
-        for r in rtb.routes
-        if r.target_kind != M.T_LOCAL and r.state == "active"
-    ]
-    lines = [f"{rtb.label}", f"{rtb.id} ({len(rtb.routes)} routes)"]
-    for route in interesting[:4]:
-        lines.append(f"{route.destination} \u2192 {route.target_id}")
-    if len(interesting) > 4:
-        lines.append(f"+{len(interesting) - 4} more")
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------- #
-# diagrams
-# --------------------------------------------------------------------------- #
-
-
-def render_overview(topo, max_vpcs: int = 40) -> str:
-    """One high-level diagram: VPCs and how they are connected."""
-    b = MermaidBuilder("AWS network overview", "LR")
-    vpcs = sorted(topo.vpcs.values(), key=lambda v: (v.region, v.name or v.id))
-    vpcs = vpcs[:max_vpcs]
-    for vpc in vpcs:
-        with b.subgraph(f"vpc:{vpc.id}", f"{vpc.label}\n{vpc.region} {vpc.cidr}\n{vpc.id}"):
-            subnets = topo.subnets_by_vpc.get(vpc.id, [])
-            public = [s for s in subnets if _subnet_is_public(topo, s)]
-            private = [s for s in subnets if s not in public]
-            igw = topo.igw_for_vpc(vpc.id)
-            if igw:
-                b.node(f"igw:{vpc.id}", f"IGW {igw.id[-6:]}", "stadium", "igw")
-            atts = topo.tgw_attachments_for_vpc(vpc.id)
-            for att in atts:
-                b.node(
-                    f"tgwatt:{att.id}",
-                    f"TGW attach\n{', '.join(att.cidr_blocks) or vpc.cidr}",
-                    "stadium",
-                    "tgw",
-                )
-            b.node(
-                f"vpc:{vpc.id}:subnets",
-                f"{len(subnets)} subnets\n({len(public)} public / {len(private)} private)"
-                if subnets
-                else "no subnets",
-                "box",
-                "private",
-            )
-            wls = topo.workloads_by_vpc.get(vpc.id, [])
-            if wls:
-                counts: Dict[str, int] = {}
-                for wl in wls:
-                    counts[wl.kind] = counts.get(wl.kind, 0) + 1
-                summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
-                b.node(f"vpc:{vpc.id}:wl", summary, "box", "private")
-                b.edge(f"vpc:{vpc.id}:subnets", f"vpc:{vpc.id}:wl", "hosts")
-
-    # connectivity edges
-    for tgw in topo.tgws.values():
-        key = f"tgw:{tgw.id}"
-        b.node(key, f"TGW\n{tgw.label}\n{tgw.region}", "stadium", "tgw")
-        for att in tgw.attachments:
-            if att.resource_type != "vpc":
-                continue
-            for anchor in (f"tgwatt:{att.id}", f"vpc:{att.resource_id}:subnets"):
-                if anchor in b._ids:
-                    b.edge(anchor, key, att.cidr_blocks[0] if att.cidr_blocks else "", "-.->")
-        for att in tgw.attachments:
-            if att.resource_type in ("vpn", "dXGateway", "TransitGateway", "peering"):
-                b.node(
-                    f"att:{att.id}",
-                    f"{att.resource_type} attach\n{att.resource_id}",
-                    "hex",
-                    "tgw",
-                )
-                b.edge(key, f"att:{att.id}", att.state, "-.->")
-
-    for pcx in topo.peerings.values():
-        if pcx.status != "active" or pcx.vpc_id not in topo.vpcs or pcx.peer_vpc_id not in topo.vpcs:
-            continue
-        a, c = f"vpc:{pcx.vpc_id}:subnets", f"vpc:{pcx.peer_vpc_id}:subnets"
-        if a in b._ids and c in b._ids:
-            suffix = f" ({pcx.peer_region})" if not pcx.intra_region else ""
-            b.edge(a, c, f"peering{suffix}", "<-.->")
-
-    has_onprem = bool(topo.vpn_gateways or topo.vpn_connections)
-    if has_onprem:
-        b.node("onprem", "On-premises / Direct Connect", "stadium", "onprem")
-        for vgw in topo.vpn_gateways.values():
-            if vgw.vpc_id in topo.vpcs:
-                b.edge("onprem", f"vpc:{vgw.vpc_id}:subnets", vgw.state, "-.->")
-    if topo.igws:
-        b.node("internet", "INTERNET", "stadium", "internet")
-        for vpc_id in topo.vpcs:
-            if topo.igw_for_vpc(vpc_id):
-                b.edge("internet", f"vpc:{vpc_id}:subnets", "IGW", "-.->")
-    return b.render()
-
-
-def _subnet_is_public(topo, subnet: Subnet) -> bool:
-    rtb = topo.rtb_for_subnet(subnet.id)
-    if not rtb:
-        return False
-    return any(
-        r.target_kind in (M.T_INTERNET, M.T_EIGW) and r.state == "active" for r in rtb.routes
-    )
-
-
-def render_vpc(topo, vpc_id: str, max_subnets: int = 40, max_workloads: int = 40) -> str:
-    """Detail diagram for one VPC: subnets, their route tables and workloads."""
-    vpc = topo.vpcs.get(vpc_id)
-    b = MermaidBuilder(f"VPC {vpc.label if vpc else vpc_id}", "TB")
-    igw = topo.igw_for_vpc(vpc_id)
-    if igw:
-        b.node(f"igw:{igw.id}", f"Internet Gateway\n{igw.name}", "stadium", "igw")
-        b.node("internet", "INTERNET", "stadium", "internet")
-        b.edge("internet", f"igw:{igw.id}", "", "-.->")
-    for eigw_route in _egress_only(topo, vpc_id):
-        b.node(f"eigw:{eigw_route}", "Egress-only IGW", "stadium", "igw")
-    for ep in topo.endpoints_by_vpc.get(vpc_id, []):
-        b.node(
-            f"ep:{ep.id}",
-            f"VPC Endpoint\n{ep.short_service}\n{ep.vpc_endpoint_type}",
-            "hex",
-            "endpoint",
-        )
-    for att in topo.tgw_attachments_for_vpc(vpc_id):
-        tgw = topo.tgws.get(att.tgw_id)
-        if tgw:
-            b.node(f"tgw:{tgw.id}", f"Transit Gateway\n{tgw.label}\n{tgw.region}", "stadium", "tgw")
-        b.node(
-            f"tgwatt:{att.id}",
-            f"Transit Gateway attach\n{', '.join(att.cidr_blocks) or vpc.cidr if vpc else ''}\n{att.state}",
-            "stadium",
-            "tgw",
-        )
-        if tgw:
-            b.edge(
-                f"tgwatt:{att.id}",
-                f"tgw:{tgw.id}",
-                "",
-                "-.->",
-            )
-    for pcx in topo.peers_of_vpc(vpc_id):
-        peer = topo.vpcs.get(pcx.peer_vpc_id)
-        b.node(
-            f"pcx:{pcx.id}",
-            f"Peering\n{peer.label if peer else pcx.peer_vpc_id}\n{pcx.status}",
-            "hex",
-            "peering" if pcx.status == "active" else "blocked",
-        )
-    for vgw in topo.vpn_gateways.values():
-        if vgw.vpc_id == vpc_id:
-            conns = [c for c in topo.vpn_connections.values() if c.vgw_id == vgw.id]
-            b.node(
-                f"vgw:{vgw.id}",
-                f"VPN Gateway\n{', '.join(sorted({c.state for c in conns})) or vgw.state}",
-                "stadium",
-                "onprem",
-            )
-            b.node("onprem", "On-premises / DX", "stadium", "onprem")
-            b.edge("onprem", f"vgw:{vgw.id}", "", "-.->")
-
-    subnets = topo.subnets_by_vpc.get(vpc_id, [])
-    shown = subnets[:max_subnets]
-    workloads = topo.workloads_by_vpc.get(vpc_id, [])[:max_workloads]
-
-    for subnet in shown:
-        rtb = topo.rtb_for_subnet(subnet.id)
-        key = f"sn:{subnet.id}"
-        b.node(key, f"{subnet.name}\n{subnet.cidr}\n{subnet.az}\n{subnet.id}", "box", subnet_class(subnet, rtb))
-        if rtb:
-            rkey = f"rtb:{rtb.id}"
-            b.node(rkey, route_table_label(rtb), "subroutine", "rtb")
-            b.edge(key, rkey, "uses", "-.->")
-            _wire_routes(b, topo, rtb, subnet=subnet)
-        for wl in topo.workloads_by_subnet.get(subnet.id, []):
-            wkey = workload_key(wl)
-            if wkey not in b._ids:
-                b.node(wkey, workload_label(wl), "round", _workload_class(wl))
-                b.edge(wkey, key, "attached", "-.->")
-    for wl in workloads:
-        wkey = workload_key(wl)
-        if wkey not in b._ids and wl.subnet_ids:
-            b.node(wkey, workload_label(wl), "round", _workload_class(wl))
-            anchor = next((f"sn:{s}" for s in wl.subnet_ids if f"sn:{s}" in b._ids), None)
-            if anchor:
-                b.edge(wkey, anchor, "spans", "-.->")
-
-    if len(subnets) > max_subnets:
-        b.node(f"sn:more", f"+{len(subnets) - max_subnets} more subnets (not drawn)", "box", "warn")
-    if len(topo.workloads_by_vpc.get(vpc_id, [])) > max_workloads:
-        b.node(
-            f"wl:more",
-            f"+{len(topo.workloads_by_vpc.get(vpc_id, [])) - max_workloads} more workloads",
-            "box",
-            "warn",
-        )
-    return b.render()
-
-
-def _egress_only(topo, vpc_id: str) -> List[str]:
-    out = []
-    for rtb in topo.rtbs_by_vpc.get(vpc_id, []):
-        for route in rtb.routes:
-            if route.target_kind == M.T_EIGW and route.target_id not in out:
-                out.append(route.target_id)
-    return out
-
-
-def _workload_class(wl: Workload) -> str:
-    if wl.kind == "rds":
-        return "data"
-    if wl.extra.get("public_ips") or wl.extra.get("public") or wl.extra.get("scheme") == "internet-facing":
-        return "public"
-    if wl.kind in ("alb", "nlb", "gwlb"):
-        return "public" if wl.extra.get("scheme") == "internet-facing" else "private"
-    return "private"
-
-
-def _wire_routes(b: MermaidBuilder, topo, rtb: RouteTable, subnet: Optional[Subnet] = None) -> None:
-    src = f"rtb:{rtb.id}"
-    drawn = 0
-    for route in rtb.routes:
-        if route.state != "active":
-            continue
-        kind = route.target_kind
-        dst_key = None
-        if kind == M.T_INTERNET:
-            igw = topo.igws.get(route.target_id)
-            dst_key = f"igw:{route.target_id}" if igw else None
-        elif kind == M.T_EIGW:
-            dst_key = f"eigw:{route.target_id}"
-        elif kind == M.T_NAT:
-            dst_key = f"nat:{route.target_id}"
-        elif kind == M.T_TGW:
-            for att in topo.tgw_attachments_for_vpc(rtb.vpc_id):
-                if att.tgw_id == route.target_id:
-                    dst_key = f"tgwatt:{att.id}"
-                    break
-        elif kind == M.T_PEERING:
-            dst_key = f"pcx:{route.target_id}"
-        elif kind == M.T_VGW:
-            dst_key = f"vgw:{route.target_id}"
-        elif kind == M.T_ENDPOINT:
-            dst_key = f"ep:{route.target_id}"
-        elif kind == M.T_ENI:
-            eni = topo.enis.get(route.target_id)
-            if eni:
-                dst_key = workload_key_wl(wl=eni) or None
-        if dst_key is None or dst_key not in b._ids:
-            continue
-        label = route.destination if not is_default_route(route.destination) else "default"
-        b.edge(src, dst_key, label, "-->" if not is_default_route(route.destination) else "==>", 46)
-        drawn += 1
-        if drawn >= 8:
-            break
-    if subnet is not None:
-        nat = topo.nat_in_subnet(subnet.id)
-        if nat and f"nat:{nat.id}" not in b._ids:
-            b.node(f"nat:{nat.id}", f"NAT Gateway\n{nat.name}\n{nat.state}", "hex", "nat")
-            if f"nat:{nat.id}" in b._ids and f"sn:{subnet.id}" in b._ids:
-                b.edge(f"nat:{nat.id}", f"sn:{subnet.id}", "resides in", "-.->")
-
-
-def workload_key_wl(wl) -> Optional[str]:
-    if getattr(wl, "workload_id", ""):
-        return f"wl:{wl.region}:{wl.workload_id}"
-    return None
-
-
-def render_tgw(topo) -> str:
-    b = MermaidBuilder("Transit gateway topology", "LR")
-    for tgw in topo.tgws.values():
-        with b.subgraph(f"tgw:{tgw.id}", f"{tgw.label} ({tgw.region}) state={tgw.state}"):
-            tkey = f"tgw:{tgw.id}"
-            b.node(tkey, f"TGW {tgw.id}", "stadium", "tgw")
-            for rtb in tgw.route_tables:
-                rkey = f"tgwrtb:{rtb.id}"
-                routes = "\n".join(
-                    f"{r.destination} \u2192 {r.target_id[:8]}" for r in rtb.routes[:6]
-                ) or "no routes"
-                more = f"\n+{len(rtb.routes) - 6} more" if len(rtb.routes) > 6 else ""
-                b.node(
-                    rkey,
-                    f"{rtb.name or rtb.id}\n{'default-association' if rtb.default_association else 'explicit'}\n{routes}{more}",
-                    "subroutine",
-                    "rtb",
-                )
-                b.edge(rkey, tkey, "routes via", "-.->")
-            for att in tgw.attachments:
-                akey = f"att:{att.id}"
-                target = topo.vpcs.get(att.resource_id) if att.resource_type == "vpc" else None
-                label = (
-                    f"{att.resource_type} attach\n{target.label if target else att.resource_id}\n"
-                    f"{', '.join(att.cidr_blocks) or 'no cidr'}\nstate={att.state}"
-                )
-                cls = "tgw" if att.state == "available" else "blocked"
-                b.node(akey, label, "hex", cls)
-                b.edge(tkey, akey, "", "-->")
-                for rtb in tgw.route_tables:
-                    if att.id in rtb.associations:
-                        b.edge(f"tgwrtb:{rtb.id}", akey, "associated", "-.->")
-    if not topo.tgws:
-        b.node("none", "no transit gateways in this account", "box")
-    return b.render()
-
-
-def render_internet(topo) -> str:
-    b = MermaidBuilder("Internet egress and ingress paths", "TB")
-    b.node("internet", "INTERNET", "stadium", "internet")
-    if not topo.igws and not topo.nat_gateways:
-        b.node("none", "no internet gateways or NAT gateways", "box")
-        return b.render()
-    for igw in topo.igws.values():
-        vpc = topo.vpcs.get(igw.vpc_id)
-        key = f"igw:{igw.id}"
-        b.node(
-            key,
-            f"IGW {igw.id}\n{vpc.label if vpc else igw.vpc_id or 'not attached'}\n"
-            f"{'attached' if igw.attached else 'DETACHED'}",
-            "stadium",
-            "igw" if igw.attached else "blocked",
-        )
-        b.edge("internet", key, "", "-->")
-        for subnet in topo.subnets_by_vpc.get(igw.vpc_id, []):
-            rtb = topo.rtb_for_subnet(subnet.id)
-            if not rtb:
-                continue
-            if not any(
-                r.target_kind == M.T_INTERNET and r.state == "active" and r.target_id == igw.id
-                for r in rtb.routes
-            ):
-                continue
-            skey = f"sn:{subnet.id}"
-            if skey not in b._ids:
-                b.node(skey, f"{subnet.name}\n{subnet.cidr}\n{subnet.id}", "box", "public")
-                for wl in topo.workloads_by_subnet.get(subnet.id, [])[:6]:
-                    wkey = workload_key(wl)
-                    b.node(wkey, workload_label(wl), "round", _workload_class(wl))
-                    b.edge(wkey, skey, style="-.->")
-            b.edge(key, skey, "public subnets", "-->")
-    for nat in topo.nat_gateways.values():
-        vpc = topo.vpcs.get(nat.vpc_id)
-        key = f"nat:{nat.id}"
-        b.node(
-            key,
-            f"NAT {nat.id}\n{vpc.label if vpc else ''}\n{nat.connect_type} / {nat.state}",
-            "hex",
-            "nat" if nat.state == "available" else "blocked",
-        )
-        igw = topo.igw_for_vpc(nat.vpc_id)
-        if igw:
-            b.edge(key, f"igw:{igw.id}", "outbound", "-->")
-        for subnet in topo.subnets_by_vpc.get(nat.vpc_id, []):
-            rtb = topo.rtb_for_subnet(subnet.id)
-            if not rtb:
-                continue
-            if any(r.target_kind == M.T_NAT and r.target_id == nat.id for r in rtb.routes):
-                skey = f"sn:{subnet.id}"
-                if skey not in b._ids:
-                    b.node(skey, f"{subnet.name}\n{subnet.cidr}\n{subnet.id}", "box", "private")
-                b.edge(skey, key, "default route", "-->")
-    return b.render()
-
-
-def render_subnet(topo, subnet_id: str) -> str:
-    subnet = topo.subnets.get(subnet_id)
-    b = MermaidBuilder(f"Subnet {subnet.label if subnet else subnet_id}", "TB")
-    if not subnet:
-        b.node("missing", f"subnet {subnet_id} not found", "box")
-        return b.render()
-    b.node("internet", "INTERNET", "stadium", "internet")
-    skey = f"sn:{subnet.id}"
-    b.node(skey, f"{subnet.name}\n{subnet.cidr}\n{subnet.az}\n{subnet.id}", "box", subnet_class(subnet, topo.rtb_for_subnet(subnet.id)))
-    rtb = topo.rtb_for_subnet(subnet.id)
-    if rtb:
-        b.node(f"rtb:{rtb.id}", route_table_label(rtb), "subroutine", "rtb")
-        b.edge(skey, f"rtb:{rtb.id}", f"{subnet.rtb_association} association", "-.->")
-        _wire_routes(b, topo, rtb, subnet=subnet)
-    for eni in topo.enis_by_subnet.get(subnet.id, []):
-        ekey = f"eni:{eni.id}"
-        ip = eni.private_ip + (f" / {eni.public_ip}" if eni.public_ip else "")
-        b.node(ekey, f"{eni.label}\n{ip}\n{', '.join(eni.sg_ids) or 'no sg'}", "round", "public" if eni.public_ip else "private")
-        b.edge(ekey, skey, "in", "-.->")
-    for wl in topo.workloads_by_subnet.get(subnet.id, []):
-        wkey = workload_key(wl)
-        if wkey not in b._ids:
-            b.node(wkey, workload_label(wl), "round", _workload_class(wl))
-            b.edge(wkey, skey, "attached", "-.->")
-    return b.render()
-
-
-def render_connectivity(topo, paths: Sequence) -> str:
-    """Diagram of evaluated flows, one swimlane-ish box per result."""
-    b = MermaidBuilder("Evaluated connectivity", "LR")
-    if not paths:
-        b.node("none", "no flows evaluated", "box")
-        return b.render()
-    for i, p in enumerate(paths):
-        key = f"flow:{i}"
-        verdict = getattr(p, "verdict", "unknown")
-        cls = {"reachable": "private", "blocked": "blocked"}.get(verdict, "warn")
-        hops = " \u2192 ".join(
-            str(getattr(h, "label", h)).split("\n")[0] for h in getattr(p, "hops", [])
-        )
-        b.node(key, f"{verdict.upper()}\n{trunc(hops, 90)}", "box", cls)
-    return b.render()
-
-
-# --------------------------------------------------------------------------- #
-# layered data-flow diagram
-# --------------------------------------------------------------------------- #
-
-# Each layer is drawn as a subgraph so the vertical order in the picture is the
-# order a packet takes: internet, then edge gateways, then VPC tiers, then the
-# compute, then the network cards and the rules that admit or drop traffic.
-FLOW_ORDER = (
-    "internet",
-    "edge",
-    "tgw",
-    "peering",
-    "vpc-public",
-    "vpc-private",
-    "vpc-data",
-    "compute",
-    "rules",
-)
-
-FLOW_LABELS = {
-    "internet": "Internet / on-premises",
-    "edge": "Edge gateways (IGW, NAT, VGW)",
-    "tgw": "Transit gateways and peerings",
-    "peering": "VPC peering",
-    "vpc-public": "Public subnets",
-    "vpc-private": "Private subnets",
-    "vpc-data": "Data subnets",
-    "compute": "Workloads (EC2, ALB, RDS, ECS, EKS, Lambda)",
-    "rules": "Network interfaces, security groups, NACLs",
-}
 
 
 def _sg_ingress_summary(topo: Topology, sg_ids: Sequence[str], limit: int = 3) -> List[str]:
@@ -677,203 +217,423 @@ def _sg_ingress_summary(topo: Topology, sg_ids: Sequence[str], limit: int = 3) -
     return out
 
 
-def render_flow(topo: Topology, vpc_id: str = "", max_targets: int = 12) -> str:
-    """One layered diagram: internet -> gateways -> subnets -> workloads -> rules.
+# --------------------------------------------------------------------------- #
+# THE single topology diagram
+# --------------------------------------------------------------------------- #
+#
+# One diagram for the whole account. Two visual languages, never mixed:
+#
+#   containers   AWS Account > VPC > Availability Zone > Subnet
+#                where a thing LIVES
+#   arrows       network traffic path, always labelled with the route that
+#                justifies it (destination, next hop, port)
+#
+# NACLs and security groups are never nodes. They are lines inside the label of
+# the container (NACL) or the resource (SG). ``local`` is never a node either --
+# it appears in the label of an intra-VPC arrow.
 
-    This is the "single interconnected" view. Subnets become subgraphs so the
-    tiers line up vertically, and every edge is a real configured route or a real
-    load balancer target rather than a generic association.
-    """
-    vpcs = [topo.vpcs[vpc_id]] if vpc_id and vpc_id in topo.vpcs else sorted(
-        topo.vpcs.values(), key=lambda v: (v.region, v.id)
+MAX_TOPOLOGY_SUBNETS = 400
+MAX_SG_RULES = 2
+
+CLASS_ORDER = {"public": 0, "private": 1, "isolated": 2}
+
+
+def render_topology(
+    topo: Topology,
+    model: Optional["flow.FlowModel"] = None,
+    *,
+    max_vpcs: int = 60,
+    max_subnets: int = MAX_TOPOLOGY_SUBNETS,
+) -> str:
+    """Render the one and only AWS network connectivity / traffic flow map."""
+    if model is None:
+        model = flow.build_flow_model(topo)
+
+    b = MermaidBuilder(
+        f"AWS network connectivity / traffic flow map ({topo.account_id or 'account'})", "TB"
     )
-    title = f"Data flow: {topo.vpcs[vpc_id].label}" if vpc_id and vpc_id in topo.vpcs else "Data flow: whole account"
-    b = MermaidBuilder(title, "TB")
+    b.free("  %% containers = where a resource lives; arrows = network traffic path")
+    b.free("  %% NACL and security groups are metadata inside labels, never nodes")
+    b.free("  %% arrow labels show the route that justifies the path (longest-prefix match)")
 
-    b.node("internet", "INTERNET\n/ on-premises / DX", "stadium", "internet")
+    defined: Set[str] = set()
 
+    # -- external networks ------------------------------------------------
+    b.node(flow.internet_node(), "INTERNET", "stadium", "internet", 60)
+    defined.add(flow.internet_node())
+
+    # On-premises exists as soon as anything hybrid is present.
+    if topo.vpn_gateways or topo.vpn_connections or topo.tgws:
+        b.node(
+            flow.onprem_node(),
+            "ON-PREMISES\nCORPORATE / DATA CENTRE",
+            "box",
+            "onprem",
+            60,
+        )
+        defined.add(flow.onprem_node())
+
+    # AWS service endpoints a VPC endpoint fronts.
+    for endpoint in list(topo.endpoints.values())[:12]:
+        svc = endpoint.service_name or "aws service"
+        node = flow.service_node(svc)
+        if node in defined:
+            continue
+        short = _service_short(svc)
+        b.node(node, f"AWS SERVICE\n{short}", "stadium", "endpoint", 120)
+        defined.add(node)
+
+    # An IGW that is not attached to any VPC is still a route target, so it must
+    # appear or its arrows would dangle. This is a real misconfiguration.
+    attached = {i.id for v in topo.vpcs.values() for i in topo.igw_by_vpc.get(v.id, [])}
+    for igw in topo.igws.values():
+        if igw.id in attached:
+            continue
+        node = flow.nid("igw", igw.id)
+        b.node(
+            node,
+            f"INTERNET GATEWAY\n{igw.id}\nNOT ATTACHED TO ANY VPC",
+            "round",
+            "blocked",
+            200,
+        )
+        defined.add(node)
+
+    # -- transit gateways (regional, not inside any VPC) ------------------
+    for tgw in list(topo.tgws.values())[:8]:
+        node = flow.nid("tgw", tgw.id)
+        label = [f"TRANSIT GATEWAY {tgw.label}"]
+        label.append(f"{tgw.id}")
+        if tgw.state:
+            label.append(tgw.state)
+        label.extend(model.notes.get(node, []))
+        b.node(node, "\n".join(label), "hex", "tgw", 200)
+        defined.add(node)
+
+    # -- VPCs -------------------------------------------------------------
+    vpcs = list(topo.vpcs.values())[:max_vpcs]
     for vpc in vpcs:
-        igw = topo.igw_for_vpc(vpc.id)
-        nat_gws = topo.nat_by_vpc.get(vpc.id, [])
-        vgws = [g for g in topo.vpn_gateways.values() if g.vpc_id == vpc.id]
+        _emit_vpc(b, model, topo, vpc, defined, max_subnets)
 
-        # -- edge gateways ------------------------------------------------
-        if igw:
-            b.node(f"igw:{igw.id}", f"Internet Gateway\n{igw.name}\n{vpc.cidr}", "stadium", "igw")
-            b.edge("internet", f"igw:{igw.id}", "HTTPS/80/443", "-->")
-        for nat in nat_gws:
-            b.node(f"nat:{nat.id}", f"NAT Gateway\n{nat.state}\n{nat.connect_type}", "stadium", "nat")
-            b.edge(f"nat:{nat.id}", "internet", "egress", "-.->")
-            if igw:
-                b.edge(f"nat:{nat.id}", f"igw:{igw.id}", "via", "-.->")
-        for vgw in vgws:
-            b.node(f"vgw:{vgw.id}", f"VPN Gateway\n{vgw.state}", "stadium", "onprem")
-            b.edge("internet", f"vgw:{vgw.id}", "VPN", "-->")
+    # -- arrows -----------------------------------------------------------
+    for edge in model.edges:
+        if edge.src in defined and edge.dst in defined:
+            b.edge(edge.src, edge.dst, edge.label, edge.style, 120)
 
-        # -- transit / peering -------------------------------------------
-        for att in topo.tgw_attachments_for_vpc(vpc.id):
-            tgw = topo.tgws.get(att.tgw_id)
-            if not tgw:
+    # -- anything referenced but never placed gets an honest stub ---------
+    for edge in model.edges:
+        for key in (edge.src, edge.dst):
+            if key in defined:
                 continue
-            tkey = f"tgw:{tgw.id}"
-            if tkey not in b._ids:
-                b.node(tkey, f"Transit Gateway\n{tgw.label}\n{tgw.region}", "stadium", "tgw")
-                b.edge(tkey, "internet", "via TGW", "-.->")
-            b.node(
-                f"tgwatt:{att.id}",
-                f"TGW attachment\n{', '.join(att.cidr_blocks) or vpc.cidr}\n{att.state}",
-                "stadium", "tgw",
-            )
-            b.edge(tkey, f"tgwatt:{att.id}", "attached", "-->")
-        for pcx in topo.peers_of_vpc(vpc.id):
-            peer = topo.vpcs.get(pcx.peer_vpc_id)
-            b.node(
-                f"pcx:{pcx.id}",
-                f"Peering -> {peer.label if peer else pcx.peer_vpc_id}\n{pcx.status}",
-                "hex", "peering" if pcx.status == "active" else "blocked",
-            )
-            b.edge("internet", f"pcx:{pcx.id}", "intra-region", "-.->")
+            defined.add(key)
+            b.node(key, f"unresolved {key}", "box", "warn", 80)
 
-        # -- subnets, grouped by tier ------------------------------------
-        tiers: Dict[str, List[Subnet]] = {}
-        for subnet in topo.subnets_by_vpc.get(vpc.id, []):
-            tiers.setdefault(subnet_tier(subnet, topo.rtb_for_subnet(subnet.id)), []).append(subnet)
+    b.free("")
+    _legend(b, topo, model, len(vpcs))
 
-        for tier in ("public", "private", "data"):
-            subnets = tiers.get(tier, [])
-            if not subnets:
+    text = b.render()
+    if len(topo.vpcs) > max_vpcs:
+        text += f"%% NOTE: showing {max_vpcs} of {len(topo.vpcs)} VPCs\n"
+    return text
+
+
+def _emit_vpc(b, model, topo, vpc, defined: Set[str], budget: int) -> None:
+    cidrs = ", ".join(topo.vpc_cidrs(vpc.id)[:3]) or "no CIDR"
+    title = f"AWS ACCOUNT {topo.account_id or ''}\nVPC {vpc.label}  \u2014  {vpc.id}\n{cidrs}"
+    if vpc.flow_log_status and vpc.flow_log_status != "unknown":
+        title += f"\nVPC Flow Logs: {vpc.flow_log_status}"
+
+    with b.subgraph(f"vpc:{vpc.id}", title):
+        # VPC-scoped gateways: not located in any single subnet.
+        for igw in topo.igw_by_vpc.get(vpc.id, []):
+            node = flow.nid("igw", igw.id)
+            b.node(
+                node,
+                f"INTERNET GATEWAY\n{igw.id}\nattached to VPC {vpc.id}",
+                "round",
+                "igw",
+                200,
+            )
+            defined.add(node)
+
+        for vgw in topo.vpn_gateways.values():
+            if vgw.vpc_id != vpc.id:
                 continue
-            with b.subgraph(f"tier:{vpc.id}:{tier}", f"{vpc.label} / {tier} subnets"):
-                for subnet in subnets:
-                    rtb = topo.rtb_for_subnet(subnet.id)
-                    skey = f"sn:{subnet.id}"
-                    head = f"{subnet.name}\n{subnet.cidr}\n{subnet.az}"
-                    if rtb:
-                        head += f"\nrt: {rtb.name}"
-                    b.node(skey, head, "box", subnet_class(subnet, rtb))
+            node = flow.nid("vgw", vgw.id)
+            b.node(
+                node,
+                f"VIRTUAL PRIVATE GATEWAY\n{vgw.id}\n{vgw.state or ''}",
+                "round",
+                "peering",
+                200,
+            )
+            defined.add(node)
 
-                    if igw and subnet_class(subnet, rtb) == "public":
-                        b.edge(f"igw:{igw.id}", skey, "routes here", "-->")
-                    if rtb:
-                        for nat in nat_gws:
-                            if subnet.id == nat.subnet_id:
-                                b.edge(skey, f"nat:{nat.id}", "default", "-.->")
-                        for dest in _tier_destinations(topo, vpc, subnet):
-                            if dest in b._ids:
-                                b.edge(skey, dest, "", "-->")
+        for peer in topo.peerings_by_vpc.get(vpc.id, []):
+            node = flow.nid("pcx", peer.id)
+            other = peer.peer_vpc_id or "unknown vpc"
+            label = [f"VPC PEERING {peer.name}", f"{peer.id}", f"peers with {other}"]
+            label.extend(model.notes.get(node, []))
+            b.node(node, "\n".join(label), "hex", "peering", 220)
+            defined.add(node)
 
-        # -- compute, and the rules around it ---------------------------
-        # Nodes first, then wires: a subnet route to a workload needs the
-        # workload node to exist before the edge can reference it.
+        for endpoint in topo.endpoints_by_vpc.get(vpc.id, []):
+            node = flow.nid("vpce", endpoint.id)
+            svc = (endpoint.service_name or "").split(".")[-1] or "aws"
+            where = ", ".join(
+                (topo.subnets[s].az or "?") for s in (endpoint.subnet_ids or [])[:3] if s in topo.subnets
+            )
+            lines = [f"VPC ENDPOINT {svc}", endpoint.id, endpoint.vpc_endpoint_type or ""]
+            if where:
+                lines.append(f"ENIs in AZ: {where}")
+            ep_sgs: List[str] = list(endpoint.sg_ids or [])
+            if not ep_sgs:
+                for eni_id in endpoint.network_interface_ids or []:
+                    eni = topo.enis.get(eni_id)
+                    if eni and eni.sg_ids:
+                        ep_sgs = list(eni.sg_ids)
+                        break
+            lines.append(f"SG: {', '.join(ep_sgs[:2])}" if ep_sgs else "SG: none")
+            b.node(node, "\n".join(lines), "hex", "endpoint", 220)
+            defined.add(node)
+
+        # Interfaces already represented by a node we draw: workload ENIs, the
+        # NAT gateway's interface, and load balancer interfaces.
+        owned_eni_ids: Set[str] = set()
         for wl in topo.workloads_by_vpc.get(vpc.id, []):
-            wkey = workload_key(wl)
-            if wkey in b._ids:
-                continue
-            anchor = next((f"sn:{s}" for s in wl.subnet_ids if f"sn:{s}" in b._ids), None)
-            lines = [f"{wl.kind.upper()} {wl.name or wl.id}"]
-            if wl.state:
-                lines.append(wl.state)
-            if wl.private_ips:
-                lines.append(", ".join(wl.private_ips[:2]))
-            b.node(wkey, "\n".join(lines), "round", _workload_class(wl))
-            if anchor:
-                b.edge(anchor, wkey, "hosts", "-->")
-            for target in (wl.extra.get("targets") or [])[:max_targets]:
-                tid = target.get("id")
-                port = target.get("port")
-                tgt = topo.workloads.get(tid) or next(
-                    (w for w in topo.workloads.values() if w.id == tid), None
+            owned_eni_ids.update(wl.eni_ids or [])
+        for nat in topo.nat_by_vpc.get(vpc.id, []):
+            for eni in topo.enis_by_subnet.get(nat.subnet_id or "", []):
+                if eni.interface_type == "natGateway" or nat.id in (eni.description or ""):
+                    owned_eni_ids.add(eni.id)
+        for eni in topo.enis.values():
+            if eni.interface_type in ("loadBalancer", "network_load_balancer", "vpce"):
+                owned_eni_ids.add(eni.id)
+
+        subnets = list(topo.subnets_by_vpc.get(vpc.id, []))[:budget]
+        by_az: Dict[str, List[Subnet]] = {}
+        for subnet in subnets:
+            by_az.setdefault(subnet.az or "unknown-az", []).append(subnet)
+
+        for az in sorted(by_az):
+            with b.subgraph(f"az:{vpc.id}:{az}", f"AVAILABILITY ZONE {az}"):
+                ordered = sorted(
+                    by_az[az],
+                    key=lambda s: (
+                        CLASS_ORDER.get(model.routing_for(s.id).classification, 3),
+                        s.cidr,
+                    ),
                 )
-                if not tgt:
-                    continue
-                tkey_wl = workload_key(tgt)
-                if tkey_wl not in b._ids:
-                    tlines = [f"{tgt.kind.upper()} {tgt.name or tgt.id}"]
-                    if tgt.private_ips:
-                        tlines.append(", ".join(tgt.private_ips[:2]))
-                    b.node(tkey_wl, "\n".join(tlines), "round", _workload_class(tgt))
-                label = f":{port}" if port else "target"
-                health = target.get("health", "")
-                if health and health != "healthy":
-                    label += f" {health}"
-                b.edge(wkey, tkey_wl, label, "-->")
-
-        # Security groups and NACLs hang off the ENIs they belong to.
-        for wl in topo.workloads_by_vpc.get(vpc.id, []):
-            wkey = workload_key(wl)
-            for eni_id in wl.eni_ids:
-                eni = topo.enis.get(eni_id)
-                if not eni:
-                    continue
-                ekey = f"eni:{eni.id}"
-                elines = [f"ENI {eni.id}"]
-                if eni.private_ip:
-                    elines.append(eni.private_ip)
-                if eni.public_ip:
-                    elines.append(f"{eni.public_ip} (public)")
-                b.node(ekey, "\n".join(elines), "hex", "public" if eni.public_ip else "private")
-                b.edge(wkey, ekey, "on", "-.->")
-                for sg_id in eni.sg_ids:
-                    sg = topo.security_groups.get(sg_id)
-                    if not sg:
-                        continue
-                    gkey = f"sg:{sg.id}"
-                    if gkey not in b._ids:
-                        b.node(
-                            gkey,
-                            f"SG {sg.name or sg.id}\n{len(sg.ingress)} ingress / {len(sg.egress)} egress",
-                            "hex", "data",
-                        )
-                    b.edge(ekey, gkey, "uses", "-->")
-
-        # Ingress rules as explicit terminal nodes, so ports are visible.
-        _flow_rule_nodes(b, topo, vpc)
-
-    return b.render()
+                for subnet in ordered:
+                    _emit_subnet(b, model, topo, vpc, subnet, defined, owned_eni_ids)
 
 
-def _flow_rule_nodes(b: MermaidBuilder, topo: Topology, vpc) -> None:
-    """Ingress ports as explicit nodes, and NACLs attached to their subnets."""
-    for sg in topo.sgs_by_vpc.get(vpc.id, []):
-        gkey = f"sg:{sg.id}"
-        if gkey not in b._ids:
-            continue
-        for line in _sg_ingress_summary(topo, [sg.id], limit=2):
-            rkey = f"r:{sg.id}:{abs(hash(line)) % 100000}"
-            b.node(rkey, f"ingress {line}", "box", "data")
-            b.edge(gkey, rkey, "allows", "-->")
+def _emit_subnet(b, model, topo, vpc, subnet: Subnet, defined: Set[str], owned_eni_ids: Set[str]) -> None:
+    info = model.routing_for(subnet.id)
+    cls = info.classification
 
-    # NACLs gate traffic at the subnet boundary, so hang them off the subnet.
-    for subnet in topo.subnets_by_vpc.get(vpc.id, []):
+    title = f"{cls.upper()} SUBNET  \u00b7  {subnet.name}"
+    with b.subgraph(f"subnet:{subnet.id}", title):
+        # Container header. Carries identity, route table, NACL and the routes as
+        # text. It has no edges, so it can never be mistaken for a hop in the path.
+        header = [
+            f"{subnet.id}  \u00b7  {subnet.cidr or 'no cidr'}  \u00b7  AZ {subnet.az or 'unknown'}",
+        ]
+        if info.rtb_id:
+            header.append(f"Route table: {info.rtb_name or info.rtb_id} ({info.rtb_id})")
+        else:
+            header.append("Route table: none associated (main table only)")
         nacl = topo.nacl_by_subnet.get(subnet.id)
-        if not nacl:
-            continue
-        nkey = f"nacl:{nacl.id}"
-        if nkey not in b._ids:
-            b.node(
-                nkey,
-                f"NACL {nacl.name}\n{'default' if nacl.is_default else 'custom'}"
-                f"\n{len(nacl.entries)} entries",
-                "hex", "private" if nacl.is_default else "warn",
-            )
-        skey = f"sn:{subnet.id}"
-        if skey in b._ids:
-            b.edge(skey, nkey, "filtered by", "-.->")
+        if nacl is not None:
+            header.append(f"NACL: {nacl.id}  \u00b7  {_nacl_counts(nacl)}")
+        else:
+            header.append("NACL: none found")
+        header.append(_classification_reason(info))
+        for extra in info.extra_summary:
+            header.append(extra)
+        node = flow.sid(subnet.id)
+        b.node(node, "\n".join(header), "box", cls if cls in CLASSES else "private", 220)
+        defined.add(node)
+
+        # Resources that physically live here.
+        for nat in topo.nat_by_vpc.get(vpc.id, []):
+            if nat.subnet_id != subnet.id:
+                continue
+            nat_node = flow.nid("nat", nat.id)
+            lines = [f"NAT GATEWAY\n{nat.id}"]
+            if nat.state:
+                lines.append(nat.state)
+            if nat.connect_type:
+                lines.append(f"{nat.connect_type}")
+            if nat.address:
+                lines.append(nat.address)
+            nat_sgs: List[str] = []
+            for eni in topo.enis_by_subnet.get(subnet.id, []):
+                if eni.interface_type == "natGateway" or nat.id in (eni.description or ""):
+                    nat_sgs = [s for s in eni.sg_ids]
+                    break
+            lines.append(f"SG: {', '.join(nat_sgs[:2])}" if nat_sgs else "SG: none")
+            lines.extend(model.notes.get(nat_node, []))
+            b.node(nat_node, "\n".join(lines), "round", "nat", 220)
+            defined.add(nat_node)
+
+        for wl in topo.workloads_by_subnet.get(subnet.id, []):
+            _emit_workload(b, model, topo, wl, defined, cls)
+
+        for eni in topo.enis_by_subnet.get(subnet.id, []):
+            _emit_eni(b, topo, eni, defined, owned_eni_ids)
 
 
-def _tier_destinations(topo: Topology, vpc, subnet: Subnet) -> List[str]:
-    """Where a subnet's own routes send traffic, for the arrows between tiers."""
-    rtb = topo.rtb_for_subnet(subnet.id)
-    if not rtb:
-        return []
-    out: List[str] = []
-    for route in rtb.routes:
-        if route.state != "active":
-            continue
-        if route.target_kind == M.T_TGW:
-            out.append(f"tgw:{route.target_id}")
-        elif route.target_kind == M.T_PEERING:
-            out.append(f"pcx:{route.target_id}")
-        elif route.target_kind == M.T_ENDPOINT:
-            out.append(f"ep:{route.target_id}")
-    return list(dict.fromkeys(out))[:4]
+def _service_short(service_name: str) -> str:
+    """`com.amazonaws.eu-west-1.ecr.api` -> `ecr.api` (not just `api`)."""
+    parts = [p for p in service_name.split(".") if p]
+    while parts and parts[0] in ("com", "amazonaws") or (parts and parts[0].startswith(("aws-", "us-", "eu-", "ap-", "sa-", "ca-", "me-", "af-", "il-"))):
+        parts.pop(0)
+    return ".".join(parts[-2:]) or service_name
+
+
+def _nacl_counts(nacl: M.Nacl) -> str:
+    inbound = sum(1 for e in nacl.entries if not e.egress)
+    outbound = len(nacl.entries) - inbound
+    return f"{inbound} in / {outbound} out"
+
+
+def _classification_reason(info) -> str:
+    """One line: how this subnet was classified, and the route that proves it."""
+    if info.default_route is None:
+        return "Type: ISOLATED \u2014 no 0.0.0.0/0 route in its route table"
+    kind = flow.target_kind(info.default_route)
+    phrase = flow.TARGET_PHRASE.get(kind, kind)
+    return f"Type: {info.classification.upper()} \u2014 0.0.0.0/0 \u2192 {phrase}"
+
+
+def _emit_workload(b, model, topo, wl: Workload, defined: Set[str], subnet_class: str) -> None:
+    node = flow.wid(wl.id)
+    if node in defined:
+        return
+
+    lines = [_workload_title(wl), wl.id]
+    eni = topo.primary_ip_for_workload(wl)
+    if eni is not None and eni.private_ip:
+        lines.append(f"ENI {eni.private_ip}")
+    if wl.engine and wl.kind not in ("alb", "nlb", "gwlb"):
+        lines.append(wl.engine)
+    if wl.extra.get("scheme"):
+        lines.append(f"{wl.extra['scheme']} {wl.kind.upper()}")
+
+    # A load balancer with ENIs in several subnets/AZs cannot be drawn inside all
+    # of them at once, so state the full placement instead of duplicating it.
+    if len(wl.subnet_ids) > 1:
+        places = []
+        for sid_ in wl.subnet_ids[:4]:
+            host = topo.subnets.get(sid_)
+            if host is not None:
+                places.append(f"{host.az}: {host.cidr}")
+        if places:
+            lines.append(f"ENIs in {len(wl.subnet_ids)} subnets")
+            lines.extend(places)
+
+    sg_ids = list(wl.sg_ids)
+    if not sg_ids and eni is not None:
+        sg_ids = list(eni.sg_ids)  # RDS and friends carry their SGs on the ENI
+    if sg_ids:
+        shown = sg_ids[:2]
+        extra = f" (+{len(sg_ids) - 2})" if len(sg_ids) > 2 else ""
+        lines.append(f"SG: {', '.join(shown)}{extra}")
+    else:
+        lines.append("SG: none (default VPC SG behaviour)")
+
+    for rule in _sg_ingress_summary(topo, sg_ids, MAX_SG_RULES)[:MAX_SG_RULES]:
+        lines.append(f"in {rule.split(': ', 1)[-1]}")
+
+    b.node(node, "\n".join(lines), _workload_shape(wl),
+          subnet_class if subnet_class in CLASSES else "private", 320)
+    defined.add(node)
+
+
+def _workload_title(wl: Workload) -> str:
+    kind = {"ec2": "EC2", "rds": "RDS", "alb": "ALB", "nlb": "NLB", "gwlb": "GWLB"}.get(
+        wl.kind, wl.kind.upper()
+    )
+    return f"{kind} {wl.name or wl.id}"
+
+
+def _workload_shape(wl: Workload) -> str:
+    if wl.kind in ("alb", "nlb", "gwlb", "lb"):
+        return "stadium"
+    if wl.kind == "rds":
+        return "hex"
+    return "box"
+
+
+def _emit_eni(b, topo, eni, defined: Set[str], owned_eni_ids: Set[str]) -> None:
+    """Only draw ENIs that no workload or gateway node already accounts for.
+
+    An ALB's ENIs would otherwise appear twice: once inside the ALB node and
+    again as a loose interface box in the same subnet.
+    """
+    if eni.instance_id or eni.id in owned_eni_ids:
+        return
+    if eni.requester_managed and not eni.description:
+        return
+    node = f"eni_{flow._key(eni.id)}"
+    if node in defined:
+        return
+    lines = [f"NETWORK INTERFACE\n{eni.id}", eni.private_ip]
+    if eni.interface_type:
+        lines.append(f"type: {eni.interface_type}")
+    if eni.sg_ids:
+        lines.append(f"SG: {', '.join(eni.sg_ids[:2])}")
+    b.node(node, "\n".join(lines), "box", "rtb", 200)
+    defined.add(node)
+
+
+def _orphan_notes(b, topo) -> None:
+    """Name security resources that exist but attach to nothing.
+
+    These are audit-relevant (an unused security group is a common finding) and
+    they have no place in the topology, so they are recorded as comments rather
+    than being dropped without a trace.
+    """
+    used_rtb = {
+        topo.rtb_for_subnet(s.id).id
+        for s in topo.subnets.values()
+        if topo.rtb_for_subnet(s.id)
+    }
+    orphan_rtb = [r.id for r in topo.route_tables.values() if r.id not in used_rtb]
+    used_nacl = {
+        topo.nacl_by_subnet[s.id].id for s in topo.subnets.values() if topo.nacl_by_subnet.get(s.id)
+    }
+    orphan_nacl = [a.id for a in topo.nacls.values() if a.id not in used_nacl]
+    used_sg = set()
+    for wl in topo.workloads.values():
+        used_sg.update(wl.sg_ids or [])
+    for eni in topo.enis.values():
+        used_sg.update(eni.sg_ids or [])
+    orphan_sg = [g.id for g in topo.security_groups.values() if g.id not in used_sg]
+
+    if orphan_rtb:
+        b.free("  %% not associated with any subnet (no traffic path to draw): "
+               + ", ".join(sorted(orphan_rtb)))
+    if orphan_nacl:
+        b.free("  %% NACLs not associated with any subnet: " + ", ".join(sorted(orphan_nacl)))
+    if orphan_sg:
+        b.free("  %% security groups not attached to any ENI: " + ", ".join(sorted(orphan_sg)))
+
+
+def _legend(b, topo, model, vpc_count: int) -> None:
+    pub = sum(1 for r in model.routing.values() if r.classification == flow.PUBLIC)
+    priv = sum(1 for r in model.routing.values() if r.classification == flow.PRIVATE)
+    iso = len(model.routing) - pub - priv
+    b.free("  %% ---- legend ----")
+    b.free(f"  %% account {topo.account_id or 'n/a'} | {vpc_count} VPC(s) | "
+           f"{len(model.routing)} subnets: {pub} public / {priv} private / {iso} isolated")
+    b.free(f"  %% network paths drawn: {len(model.edges)} | "
+           f"workload paths traced: {model.traced} | SG-blocked: {model.blocked} | "
+           f"SG-conditional: {model.conditional}")
+    b.free("  %% containers: AWS ACCOUNT > VPC > AVAILABILITY ZONE > SUBNET (where things live)")
+    b.free("  %% solid arrow = network traffic path; label = the route / port that creates it")
+    b.free("  %% 'local' is shown in an edge label only, never as a gateway node")
+    b.free("  %% NACL appears in the subnet header; security groups in the resource node")
+    b.free("  %% routes show configured reachability potential, not observed traffic")
+    _orphan_notes(b, topo)

@@ -379,38 +379,41 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
         f"route tables {len(topo.route_tables)}, transit gateways {len(topo.tgws)}, "
         f"peerings {len(topo.peerings)}, internet gateways {len(topo.igws)}",
         "",
-        "Each `.mmd` file is Mermaid text. Paste one into <https://mermaid.live>, or render:",
+        "The tool writes **one** diagram for the whole account. It is Mermaid text:",
         "",
         "```",
-        "npx -y @mermaid-js/mermaid-cli -i 00-overview.mmd -o overview.svg",
+        "open https://mermaid.live  and paste network-map/00-network-topology.mmd",
         "```",
         "",
-        "## Diagrams",
+        "## The one diagram",
         "",
         "| File | What it shows |",
         "| --- | --- |",
+        "| `00-network-topology.mmd` | The complete AWS network: external networks, gateways, "
+        "then nested `AWS Account > VPC > Availability Zone > Subnet` containers holding the "
+        "resources that live there. |",
+        "",
+        "How to read it:",
+        "",
+        "- **Boxes you can nest** are *location*: a subnet is where a resource lives.",
+        "- **Arrows are traffic paths.** Every arrow is labelled with the route that "
+        "creates it (`0.0.0.0/0 --> NAT Gateway`) or the port and route for a "
+        "workload-to-workload path (`TCP :5432` / `via 10.0.0.0/16 local`).",
+        "- **`local` is never a node.** It appears in an arrow label, because it is "
+        "intra-VPC routing, not a gateway.",
+        "- **NACLs are not nodes.** They appear in the subnet header "
+        "(`NACL: acl-... (4 in / 2 out)`) because they filter at the subnet boundary.",
+        "- **Security groups are not nodes.** They appear inside the resource "
+        "(`SG: sg-...`, plus inbound rules) because they filter at the ENI.",
+        "- **`SG DENIES` on an arrow** means the route genuinely exists but a security "
+        "group blocks it. The route is still a route; the block is not a fake hop.",
+        "- **A region with no default route** is drawn as `ISOLATED`, and that "
+        "classification is derived from the route table, not the subnet name.",
+        "",
+        "Arrows show *configured reachability*, not observed traffic. Terms used are "
+        "\"network path\" and \"route exists\", never \"application talks to\".",
+        "",
     ]
-    described = {
-        "00-data-flow.mmd": "the whole account as one chain: internet, gateways, subnets, workloads, ENIs, SGs and ports",
-        "01-overview.mmd": "every VPC, transit gateway attachment, peering, internet gateway and on-prem VPN",
-        "02-transit-gateways.mmd": "transit gateway attachments, their route tables and associations",
-        "03-internet-paths.mmd": "internet gateways, NAT gateways, public subnets and elastic IPs",
-    }
-    vpc_files = [d for d in diagrams if d.startswith("vpcs/")]
-    sub_files = [d for d in diagrams if d.startswith("subnets/")]
-    for name in diagrams:
-        if not name.startswith(("vpcs/", "subnets/")):
-            lines.append(f"| `{name}` | {described.get(name, 'topology')} |")
-    if vpc_files:
-        lines.append(
-            f"| `vpcs/*-flow.mmd` | one layered flow diagram per VPC (same shape as the account-level one) |"
-        )
-        lines.append(f"| `vpcs/` ({len(vpc_files)}) | per VPC: subnets, route tables, gateways, workloads |")
-    if sub_files:
-        lines.append(f"| `subnets/` ({len(sub_files)}) | one file per subnet: route table, gateways, workloads |")
-    if not vpc_files and not sub_files:
-        lines.append("| _(none)_ | |")
-
     lines += ["", "## Findings", ""]
     if findings:
         order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
