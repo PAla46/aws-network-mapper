@@ -40,7 +40,7 @@ CLASSES = {
     "public": ("fill:#fed7aa,stroke:#c2410c,color:#431407",),
     "private": ("fill:#e2e8f0,stroke:#475569,color:#0f172a",),
     "data": ("fill:#dcfce7,stroke:#15803d,color:#052e16",),
-    "iface": ("fill:#f1f5f9,stroke:#64748b,color:#0f172a,stroke-dasharray:4 3",),
+    "rtb": ("fill:#f1f5f9,stroke:#64748b,color:#0f172a,stroke-dasharray:4 3",),
     "onprem": ("fill:#e7e5e4,stroke:#57534e,color:#1c1917",),
     "blocked": ("fill:#fee2e2,stroke:#b91c1c,color:#450a0a",),
     "warn": ("stroke-dasharray:4 3",),
@@ -497,38 +497,27 @@ def _emit_subnet(b, model, topo, vpc, subnet: Subnet, defined: Set[str], owned_e
     info = model.routing_for(subnet.id)
     cls = info.classification
 
-    # The prose belongs in the container title, the way the VPC container carries
-    # its own. Drawing it as a node put a five-line text rectangle at the head of
-    # every subnet, which read like a resource sitting in the subnet rather than
-    # a property of it.
-    title = [f"{cls.upper()} SUBNET  ·  {subnet.name}", subnet.id]
-    title.append(_classification_reason(info))
-    if info.rtb_id:
-        title.append(f"Route table: {info.rtb_name or info.rtb_id} ({info.rtb_id})")
-    else:
-        title.append("Route table: none associated (main table only)")
-    nacl = topo.nacl_by_subnet.get(subnet.id)
-    if nacl is not None:
-        title.append(f"NACL: {nacl.id}  ·  {_nacl_counts(nacl)}")
-    else:
-        title.append("NACL: none found")
-    extras = info.extra_summary
-    if extras:
-        shown = ", ".join(extras[:4])
-        if len(extras) > 4:
-            shown += f" (+{len(extras) - 4} more)"
-        title.append(f"Other routes: {shown}")
-
-    # Paths terminate on the subnet itself, so it has to stay a declared node or
-    # Mermaid silently drops every arrow that points at one. Keep it to the
-    # network address, which is what identifies a subnet at a glance.
-    node = flow.sid(subnet.id)
-    where = subnet.cidr or "no cidr"
-    if subnet.az:
-        where += f"  ·  {subnet.az}"
-
-    with b.subgraph(f"subnet:{subnet.id}", "\n".join(title)):
-        b.node(node, where, "box", cls if cls in CLASSES else "private", 80)
+    title = f"{cls.upper()} SUBNET  \u00b7  {subnet.name}"
+    with b.subgraph(f"subnet:{subnet.id}", title):
+        # Container header. Carries identity, route table, NACL and the routes as
+        # text. It has no edges, so it can never be mistaken for a hop in the path.
+        header = [
+            f"{subnet.id}  \u00b7  {subnet.cidr or 'no cidr'}  \u00b7  AZ {subnet.az or 'unknown'}",
+        ]
+        if info.rtb_id:
+            header.append(f"Route table: {info.rtb_name or info.rtb_id} ({info.rtb_id})")
+        else:
+            header.append("Route table: none associated (main table only)")
+        nacl = topo.nacl_by_subnet.get(subnet.id)
+        if nacl is not None:
+            header.append(f"NACL: {nacl.id}  \u00b7  {_nacl_counts(nacl)}")
+        else:
+            header.append("NACL: none found")
+        header.append(_classification_reason(info))
+        for extra in info.extra_summary:
+            header.append(extra)
+        node = flow.sid(subnet.id)
+        b.node(node, "\n".join(header), "box", cls if cls in CLASSES else "private", 220)
         defined.add(node)
 
         for wl in topo.workloads_by_subnet.get(subnet.id, []):
@@ -658,13 +647,12 @@ def _emit_eni(b, topo, eni, defined: Set[str], owned_eni_ids: Set[str]) -> None:
     node = f"eni_{flow._key(eni.id)}"
     if node in defined:
         return
-    # Two lines: what it is and where it sits, then the id so the box can be
-    # traced back to the API. An interface never carries an arrow, so anything
-    # beyond this is bulk competing with the paths that do.
-    head = eni.private_ip or eni.id
+    lines = [f"NETWORK INTERFACE\n{eni.id}", eni.private_ip]
     if eni.interface_type:
-        head += f"  ·  {eni.interface_type}"
-    b.node(node, f"{head}\n{eni.id}", "box", "iface", 120)
+        lines.append(f"type: {eni.interface_type}")
+    if eni.sg_ids:
+        lines.append(f"SG: {', '.join(eni.sg_ids[:2])}")
+    b.node(node, "\n".join(lines), "box", "rtb", 200)
     defined.add(node)
 
 
