@@ -527,7 +527,7 @@ not a second implementation of it.
 
 ```
 aws_network_mapper.py    entry point
-src/aws_network_mapper/
+src/mapper/
   cli.py                argument parsing and orchestration
   model/                normalized resource model and API response parsing
   discovery/            concurrent, cached, permission-tolerant collection

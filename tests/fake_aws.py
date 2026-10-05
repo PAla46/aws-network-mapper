@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from aws_network_mapper.discovery import Collector
+from mapper.discovery import Collector
 
 
 class FixtureCollector(Collector):

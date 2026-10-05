@@ -1,4 +1,4 @@
-"""Allow ``python3 -m aws_network_mapper`` once the package is installed."""
+"""Allow ``python3 -m mapper`` once the package is installed."""
 
 import sys
 

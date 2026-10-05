@@ -21,7 +21,7 @@ classifiers = [
 dependencies = ["boto3>=1.26"]
 
 [project.scripts]
-aws-network-mapper = "aws_network_mapper.cli:main"
+aws-network-mapper = "mapper.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
