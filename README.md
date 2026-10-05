@@ -238,9 +238,9 @@ recorded as `%%` comments at the end of the file rather than silently dropped.
 ## How a path is derived
 
 Discovery is unchanged and independent of the renderer: it collects, normalizes
-into `nm/model.py`, indexes in `nm/topology.py`, and evaluates reachability in
-`nm/paths.py`. The diagram is built *from* those verdicts, never by re-deriving
-routing, so the picture and the `--reports` CSVs cannot disagree.
+into `model/`, indexes in `graph/Topology`, and evaluates reachability in
+`graph/routing.py`. The diagram is built *from* those verdicts, never by
+re-deriving routing, so the picture and the `--reports` CSVs cannot disagree.
 
 ### Subnet classification comes from routing
 
@@ -258,12 +258,12 @@ Each header states the route that proves its classification, e.g.
 ### Longest-prefix match
 
 Route selection follows AWS behaviour: the most specific applicable route wins, via
-`nm/cidrutil.py:longest_prefix_match()`. `nm/paths.py:PathEngine.resolve()` walks
-the route table, resolves the next hop, records the hops, then evaluates security
-groups for the port.
+`util/cidr.py:longest_prefix_match()`. `graph/routing.py:PathEngine.resolve()`
+walks the route table, resolves the next hop, records the hops, then evaluates
+security groups for the port.
 
-`nm/flow.py` reuses that engine rather than re-deriving routing, so the diagram
-and the cross-VPC CSV are the same computation.
+`graph/connectivity.py` reuses that engine rather than re-deriving routing, so the
+diagram and the cross-VPC CSV are the same computation.
 
 ### Gateway next hops
 
@@ -527,20 +527,26 @@ not a second implementation of it.
 
 ```
 aws_network_mapper.py    entry point
-nm/model.py              normalized resource model and API response parsing
-nm/collect.py            concurrent, cached, permission-tolerant collection
-nm/topology.py           indexes; subnet -> effective route table resolution
-nm/cidrutil.py           CIDR and IP helpers, longest-prefix match
-nm/paths.py              route, gateway, peering and security group evaluation
-nm/flow.py               the connectivity model the diagram is drawn from
-nm/analysis.py           cross-VPC, load balancer, exposure and CIDR analyses
-nm/findings.py           the rules above
-nm/mermaid.py            the single topology renderer
-nm/report.py             CSV, JSON and Markdown writers
-nm/cli.py                argument parsing and orchestration
-nm/fixtures.py           synthetic two-region demo scenario
-nm/testing.py            fixture-backed collector used by the self-test
-nm/selftest.py           the offline checks
+src/aws_network_mapper/
+  cli.py                argument parsing and orchestration
+  model/                normalized resource model and API response parsing
+  discovery/            concurrent, cached, permission-tolerant collection
+  graph/                indexes and path evaluation; no AWS calls
+    __init__.py         Topology: indexes, subnet -> effective route table
+    routing.py          route, gateway, peering and security group evaluation
+    connectivity.py     the node/edge model the diagram is drawn from
+    cross_vpc.py        cross-VPC, load balancer, exposure, CIDR analyses
+  rules/                the rules above, with their IDs and severities
+  render/               artefact writers
+    mermaid.py          the single topology renderer
+    reports.py          CSV, JSON and Markdown writers
+  util/
+    cidr.py             CIDR and IP helpers, longest-prefix match
+
+tests/                  offline checks; not part of the installed package
+  suite.py              the 215 checks
+  scenario.py           synthetic two-region demo scenario
+  fake_aws.py           boto3 stand-in used by --demo and the suite
 ```
 
 Conventions the code holds to:
@@ -548,9 +554,9 @@ Conventions the code holds to:
 - **Identity is the ARN when one exists.** Workloads are keyed by ARN, not by
   name, so two clusters or services that share a name cannot overwrite each other
   in the workloads map. The self-test asserts ids are unique.
-- **Nodes are rendered, never inferred.** `nm/flow.py` decides the topology;
-  `nm/mermaid.py` decides only how it looks. Adding a rendering concern never
-  requires touching path evaluation.
+- **Nodes are rendered, never inferred.** `graph/connectivity.py` decides the
+  topology; `render/mermaid.py` decides only how it looks. A rendering concern
+  never requires touching path evaluation.
 - **Deterministic output.** Subgraph ids come from a counter, not `hash()`,
   because Python randomizes string hashes per process. The same inventory yields
   a byte-identical file.
@@ -562,6 +568,39 @@ Conventions the code holds to:
   asserted, because those are the shapes that appear in real accounts.
 
 Python 3.9+, standard library plus `boto3`.
+
+### Where to add things
+
+Each layer has one job, so a change belongs in exactly one place:
+
+| To add... | Put it in | Then |
+| --- | --- | --- |
+| A new AWS resource type | `model/` (the dataclass) + `discovery/` (the describe call) | Nothing else — `Topology` picks it up |
+| A new finding | a `@rule`-decorated function in `rules/` | It registers itself; the registry and the report pick it up |
+| A new way to resolve a path | `graph/routing.py` | `connectivity.py` and the diagram follow automatically |
+| A new diagram element or layout tweak | `render/mermaid.py` | No path evaluation changes |
+| A new CSV or report file | `render/reports.py` | Add the filename to the `report_files` list |
+| A new CLI flag | `cli.py` (`build_parser` + the run path) | Document it in the CLI section above |
+| A new check | `tests/suite.py` | No wiring; `run_self_test` discovers it |
+
+The dependency direction is one-way: `discovery → model`, then
+`graph → model`, then `rules`/`render → graph`. `graph` and below never import
+`discovery`, which is what makes `--offline` and the test suite possible.
+
+### Running the checks
+
+```bash
+python3 run_tests.py                    # the 215 offline checks
+python3 aws_network_mapper.py --demo --reports --out ./demo   # no AWS access
+python3 aws_network_mapper.py --all-regions --out ./map       # live, read-only
+```
+
+Optionally install it for the `aws-network-mapper` console script:
+
+```bash
+pip install -e .
+aws-network-mapper --demo --out ./demo
+```
 
 ---
 

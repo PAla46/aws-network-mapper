@@ -18,8 +18,8 @@ import os
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from . import model as M
-from .model import AccountSnapshot
+from .. import model as M
+from ..model import AccountSnapshot
 
 DEFAULT_CACHE_VERSION = 1
 

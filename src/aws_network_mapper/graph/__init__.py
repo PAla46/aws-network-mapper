@@ -1,12 +1,25 @@
-"""Fast indexes over the collected snapshots."""
+"""Derived indexes and path evaluation -- everything computed from the model.
+
+Three sibling modules, used in this order:
+
+``connectivity``  the node/edge model the diagram is drawn from: subnet
+                  classification and the arrows between resources.
+``routing``       "does a packet from A reach B" -- longest-prefix match,
+                  gateway/peering/transit resolution, security groups.
+``cross_vpc``     the pairwise analyses that only ``--reports`` needs.
+
+This module holds ``Topology``, the index that sits underneath all three: it
+indexes the raw snapshots once and resolves each subnet to its *effective* route
+table. Nothing here calls AWS -- it is all pure functions of a ``Topology``.
+"""
 
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional
 
-from . import model as M
-from .cidrutil import ip_in_net, nets_overlap
-from .model import AccountSnapshot, Eni, RouteTable, SecurityGroup, Subnet, Vpc, Workload
+from .. import model as M
+from ..model import AccountSnapshot, Eni, RouteTable, SecurityGroup, Subnet, Vpc, Workload
+from ..util.cidr import ip_in_net, nets_overlap
 
 
 class Topology:

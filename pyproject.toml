@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aws-network-mapper"
+version = "1.0.0"
+description = "Read-only AWS network, route and connectivity topology mapper"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["aws", "vpc", "network", "topology", "mermaid", "security-groups"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+]
+
+# boto3 is needed only for live runs; --demo and --self-test work without it.
+dependencies = ["boto3>=1.26"]
+
+[project.scripts]
+aws-network-mapper = "aws_network_mapper.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

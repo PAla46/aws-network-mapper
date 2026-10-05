@@ -11,16 +11,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional
 
-from . import model as M
-from .cidrutil import (
+from .. import model as M
+from ..util.cidr import (
     cidr_contains,
     is_default_route,
     ip_in_net,
     nets_overlap,
     parse_ip,
 )
-from .model import Route, RouteTable, Subnet, Vpc
-from .topology import Topology
+from ..graph import Topology
+from ..model import Route, RouteTable, Subnet, Vpc
 
 CRITICAL = "critical"
 HIGH = "high"

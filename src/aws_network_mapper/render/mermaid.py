@@ -9,9 +9,10 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from . import flow, model as M
-from .model import Subnet, Workload
-from .topology import Topology
+from .. import model as M
+from ..graph import connectivity as flow
+from ..graph import Topology
+from ..model import Subnet, Workload
 
 ESCAPES = {
     '"': "#quot;",

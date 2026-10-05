@@ -6,11 +6,11 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import model as M
-from .cidrutil import parse_net
-from .model import Eni, Subnet, Vpc, Workload
-from .paths import PathEngine, PathResult
-from .topology import Topology
+from .. import model as M
+from ..model import Eni, Subnet, Vpc, Workload
+from ..util.cidr import parse_net
+from . import Topology
+from .routing import PathEngine, PathResult
 
 
 def link_key(a: str, b: str) -> Tuple[str, str]:
@@ -296,7 +296,7 @@ def cidr_map(topo: Topology) -> List[CidrMapRow]:
         for other in subnets:
             if other.id == subnet.id:
                 continue
-            from .cidrutil import nets_overlap
+            from ..util.cidr import nets_overlap
 
             if nets_overlap(subnet.cidr, other.cidr):
                 conflicts.append(f"{other.id}:{other.cidr}")

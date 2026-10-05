@@ -10,12 +10,14 @@ import time
 import traceback
 from typing import Dict, List, Optional, Sequence
 
-from . import analysis, flow, mermaid, report
-from .collect import Collector, CollectorError
-from .findings import Finding, run_rules
+from .discovery import Collector, CollectorError
+from .graph import Topology, connectivity as flow
+from .graph import cross_vpc as analysis
+from .graph.routing import PathEngine
 from .model import AccountSnapshot
-from .paths import PathEngine
-from .topology import Topology
+from .render import mermaid
+from .render import reports as report
+from .rules import Finding, run_rules
 
 CORE_SERVICES = ("ec2-workloads", "elbv2", "rds", "ecs", "eks", "lambda")
 SERVICE_CHOICES = CORE_SERVICES + ("core-only",)
@@ -135,9 +137,31 @@ def parse_services(value: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 
 
+def _load_test_support():
+    """Import the offline scenario from the source checkout's ``tests`` package.
+
+    ``--demo`` and ``--self-test`` both need the synthetic fixtures. They live
+    outside the installable package, so we look for them next to ``src/``. In an
+    installed wheel they are absent and the caller is told to use a checkout.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    try:
+        from tests import build_fixtures
+        from tests.fake_aws import FakePool, FixtureCollector
+    except ImportError:
+        print("--demo and --self-test need the source checkout (tests/ not found).", file=sys.stderr)
+        print(f"expected it at: {os.path.join(repo_root, 'tests')}", file=sys.stderr)
+        return None
+    return build_fixtures, FakePool, FixtureCollector
+
+
 def run_demo(out_dir: str, logger: Logger, args) -> int:
-    from .fixtures import build_fixtures
-    from .testing import FakePool, FixtureCollector
+    support = _load_test_support()
+    if support is None:
+        return 2
+    build_fixtures, FakePool, FixtureCollector = support
 
     fixtures = build_fixtures()
     logger("demo mode: using the bundled synthetic scenario (no AWS API calls)")
@@ -401,11 +425,18 @@ def print_summary(
     print("View it: open https://mermaid.live and paste the .mmd text.")
 
 
+def run_self_test(verbose: bool = True) -> int:
+    """Run the offline check suite from the source checkout."""
+    if _load_test_support() is None:
+        return 2
+    from tests.suite import run_self_test as _run
+
+    return _run(verbose=verbose)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.self_test:
-        from .selftest import run_self_test
-
         return run_self_test(verbose=not args.quiet)
 
     out_dir = args.out

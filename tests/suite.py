@@ -14,13 +14,16 @@ import shutil
 import tempfile
 from typing import Any, Dict, List
 
-from . import analysis, flow, mermaid, report
-from .collect import Collector
-from .findings import run_rules
-from .fixtures import build_fixtures
-from .paths import PathEngine
-from .testing import FakePool, FixtureCollector
-from .topology import Topology
+from aws_network_mapper.discovery import Collector
+from aws_network_mapper.graph import Topology
+from aws_network_mapper.graph import connectivity as flow
+from aws_network_mapper.graph import cross_vpc as analysis
+from aws_network_mapper.graph.routing import PathEngine
+from aws_network_mapper.render import mermaid, reports as report
+from aws_network_mapper.rules import run_rules
+
+from .fake_aws import FakePool, FixtureCollector
+from .scenario import build_fixtures
 
 
 class CheckFailed(AssertionError):
@@ -588,8 +591,8 @@ def run_self_test(verbose: bool = True) -> int:
     # Regression: ECS list_clusters / list_services return ARNs as plain strings.
     # The collector used to subscript them as dicts, which raised
     # "TypeError: string indices must be integers" against a real account.
-    from .collect import Collector
-    from .model import AccountSnapshot as _Snap
+    from aws_network_mapper.discovery import Collector
+    from aws_network_mapper.model import AccountSnapshot as _Snap
 
     class _EcsClient:
         def list_clusters(self, **kw):
@@ -643,7 +646,7 @@ def run_self_test(verbose: bool = True) -> int:
         def start(self) -> None:
             self._started = True
 
-    from .model import Subnet as _Sub
+    from aws_network_mapper.model import Subnet as _Sub
 
     snap = _Snap(region="eu-west-1")
     # Subnets are collected before ECS, so the service's VPC can be inferred.
@@ -669,7 +672,7 @@ def run_self_test(verbose: bool = True) -> int:
     # Regression: a NAT gateway can reference a subnet that never made it into the
     # inventory. Rendering used to dereference the missing subnet and crash the run
     # with "'NoneType' object has no attribute 'az'".
-    from .model import NatGw, Route, RouteTable, Subnet as _Subnet
+    from aws_network_mapper.model import NatGw, Route, RouteTable, Subnet as _Subnet
 
     broken_snap = _Snap(region="eu-west-1")
     broken_snap.subnets = [
@@ -751,7 +754,7 @@ def run_self_test(verbose: bool = True) -> int:
             _edge(tgw_node, net) == [], str(_edge(tgw_node, net)))
 
     # A TGW that really does front a VPN attachment must gain both legs.
-    from .model import Tgw, TgwAttachment, TgwRoute, TgwRouteTable
+    from aws_network_mapper.model import Tgw, TgwAttachment, TgwRoute, TgwRouteTable
     dx_snap = _Snap(region="eu-west-1")
     dx_snap.tgws = [
         Tgw(id="tgw-dx", region="eu-west-1", state="available",
@@ -1014,7 +1017,7 @@ def run_self_test(verbose: bool = True) -> int:
         c.check("a NAT whose subnet was not collected still renders", False, repr(exc))
 
     print("\n[8/8] CLI entry point")
-    from .cli import main
+    from aws_network_mapper.cli import main
 
     out = tempfile.mkdtemp(prefix="nm-cli-")
     try:

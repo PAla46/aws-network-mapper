@@ -156,7 +156,7 @@ class RouteTable:
 
     def route_for(self, ip: str) -> Optional[Route]:
         """Longest-prefix-match route for *ip* (pure table lookup)."""
-        from .cidrutil import longest_prefix_match, parse_net
+        from ..util.cidr import longest_prefix_match, parse_net
 
         dest = longest_prefix_match((r.destination for r in self.routes), ip)
         if dest is None:

@@ -38,16 +38,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from . import model as M
-from .cidrutil import ip_in_net, is_default_route, parse_net
-from .paths import (
+from .. import model as M
+from ..util.cidr import ip_in_net, is_default_route, parse_net
+from .routing import (
     SG_ALLOWED,
     SG_BLOCKED,
     SG_UNKNOWN,
     PathEngine,
     security_status,
 )
-from .topology import Topology
+from . import Topology
 
 PUBLIC = "public"
 PRIVATE = "private"

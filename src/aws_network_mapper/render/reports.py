@@ -8,15 +8,15 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import model as M
-from .analysis import (
+from .. import model as M
+from ..graph.cross_vpc import (
     CidrMapRow,
     CrossVpcRow,
     ExposureRow,
     LbFlowRow,
 )
-from .findings import RULES, Finding
-from .topology import Topology
+from ..graph import Topology
+from ..rules import RULES, Finding
 
 
 def ensure_dir(path: str) -> str:

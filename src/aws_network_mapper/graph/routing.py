@@ -10,16 +10,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from . import model as M
-from .cidrutil import (
+from .. import model as M
+from ..util.cidr import (
     ip_in_net,
     longest_prefix_match,
     nets_overlap,
     parse_ip,
     parse_net,
 )
-from .model import Eni, Route, RouteTable, Subnet, Vpc, Workload
-from .topology import Topology
+from ..model import Eni, Route, RouteTable, Subnet, Vpc, Workload
+from . import Topology
 
 # verdicts
 REACHABLE = "reachable"
