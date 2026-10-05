@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from . import kinds
 from .. import model as M
 from ..graph import connectivity as flow
 from ..graph import Topology
@@ -596,42 +597,15 @@ def _emit_workload(
 
     lines = [_workload_title(wl)]
     eni = topo.primary_ip_for_workload(wl)
+    style = kinds.style_for(wl.kind)
 
-    if wl.kind in ("alb", "nlb", "gwlb", "lb"):
-        # Section 10: ALB / name / scheme / SG. Listeners earn their line
-        # because they are where traffic actually enters.
-        scheme = wl.extra.get("scheme") or ""
-        if scheme:
-            lines.append("internet-facing" if scheme == "internet-facing" else "internal")
-        listeners = _listener_summary(wl)
-        if listeners:
-            lines.append(listeners)
-        if len(wl.subnet_ids) > 1:
-            lines.append(f"in {len(wl.subnet_ids)} subnets")
-    elif wl.kind == "rds":
-        port = wl.extra.get("port") or ""
-        engine = (wl.engine or "").strip()
-        lines.append(f"{engine} :{port}".strip().rstrip(":").strip() if port else engine)
-    elif wl.kind == "ecs-service":
-        running = wl.extra.get("running_tasks")
-        desired = wl.extra.get("desired_tasks")
-        if running is None:
-            lines.append("running tasks: unknown")
-        elif running:
-            lines.append(f"{running}/{desired} tasks running")
-        else:
-            # Section 14: a service scaled to zero is a valid state, and must not
-            # be drawn with an invented runtime endpoint.
-            lines.append(f"running tasks: 0 (desired {desired})")
-    elif wl.kind == "ec2":
-        if eni is not None and eni.private_ip:
-            lines.append(eni.private_ip)
-    elif wl.kind == "eks":
-        lines.append(f"v{wl.engine or '?'} control plane")
-    elif wl.kind == "lambda":
-        lines.append(wl.engine or "function")
+    # Everything kind-specific comes from the one registry row, so a new
+    # service cannot half-render by missing one of several branches.
+    lines.extend(style.detail(wl))
 
-    if eni is not None and eni.private_ip and wl.kind not in ("alb", "nlb", "gwlb", "lb", "ec2"):
+    # Load balancers lead with their listeners instead; every other kind shows
+    # its primary private IP.
+    if style.shows_ip and eni is not None and eni.private_ip:
         lines.append(eni.private_ip)
 
     sg_ids = list(wl.sg_ids)
@@ -667,18 +641,6 @@ def _short_id(raw: str) -> str:
     return text
 
 
-def _listener_summary(wl: Workload) -> str:
-    """``443 HTTPS · 80 HTTP`` -- compact, and where traffic enters."""
-    seen: List[str] = []
-    for ln in wl.extra.get("listeners") or []:
-        proto = str(ln.get("protocol") or "")
-        port = ln.get("port")
-        text = f"{port} {proto}".strip() if port else proto
-        if text and text not in seen:
-            seen.append(text)
-    return " · ".join(seen[:4])
-
-
 def _short_sg_list(sg_ids: List[str]) -> str:
     """Security group ids, abbreviated. Full ids live in the report."""
     out = []
@@ -689,20 +651,11 @@ def _short_sg_list(sg_ids: List[str]) -> str:
 
 
 def _workload_title(wl: Workload) -> str:
-    kind = {
-        "ec2": "EC2", "rds": "RDS", "alb": "ALB", "nlb": "NLB", "gwlb": "GWLB",
-        "ecs-cluster": "ECS CLUSTER", "ecs-service": "ECS SERVICE",
-        "eks": "EKS", "lambda": "LAMBDA",
-    }.get(wl.kind, wl.kind.upper())
-    return f"{kind} {wl.name or _short_id(wl.id)}"
+    return f"{kinds.style_for(wl.kind).title(wl)} {wl.name or _short_id(wl.id)}"
 
 
 def _workload_shape(wl: Workload) -> str:
-    if wl.kind in ("alb", "nlb", "gwlb", "lb"):
-        return "stadium"
-    if wl.kind == "rds":
-        return "hex"
-    return "box"
+    return kinds.style_for(wl.kind).shape
 
 
 def _emit_eni(b, topo, eni, defined: Set[str], owned_eni_ids: Set[str]) -> None:

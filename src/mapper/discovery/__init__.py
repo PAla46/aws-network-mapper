@@ -29,6 +29,20 @@ class CollectorError(Exception):
 
 
 # --------------------------------------------------------------------------- #
+# workload kinds
+# --------------------------------------------------------------------------- #
+
+# The Workload.kind values this module can emit. Kept as data rather than buried
+# in the call sites so render/kinds.py has something to assert against: a new
+# collector that introduces a kind must add a presentation row, and the self-test
+# fails until it does.
+LB_KIND_BY_TYPE = {"application": "alb", "network": "nlb", "gateway": "gwlb"}
+# Used when ELBv2 reports a Type this module does not know about, so a new load
+# balancer type still renders instead of vanishing.
+DEFAULT_LB_KIND = "lb"
+
+
+# --------------------------------------------------------------------------- #
 # low level AWS helpers
 # --------------------------------------------------------------------------- #
 
@@ -742,9 +756,7 @@ class Collector:
             sg_ids = list(lb.get("SecurityGroups", []) or [])
             scheme = lb.get("Scheme", "internal")
             dns = lb.get("DNSName", "")
-            kind = {"application": "alb", "network": "nlb", "gateway": "gwlb"}.get(
-                lb.get("Type", "application"), "lb"
-            )
+            kind = LB_KIND_BY_TYPE.get(lb.get("Type", "application"), DEFAULT_LB_KIND)
             targets: List[Dict[str, Any]] = []
             for tg in target_groups:
                 if lb_arn not in (tg.get("LoadBalancerArns") or []):

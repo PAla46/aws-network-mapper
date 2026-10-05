@@ -19,7 +19,7 @@ Then paste `./network-map/00-network-topology.mmd` into
 No AWS account handy?
 
 ```bash
-python3 aws_network_mapper.py --self-test     # 215 offline checks, no AWS calls
+python3 aws_network_mapper.py --self-test     # 225 offline checks, no AWS calls
 python3 aws_network_mapper.py --demo --out ./demo
 ```
 
@@ -538,13 +538,14 @@ src/mapper/
     cross_vpc.py        cross-VPC, load balancer, exposure, CIDR analyses
   rules/                the rules above, with their IDs and severities
   render/               artefact writers
+    kinds.py            one row per workload kind: label, shape, detail lines
     mermaid.py          the single topology renderer
     reports.py          CSV, JSON and Markdown writers
   util/
     cidr.py             CIDR and IP helpers, longest-prefix match
 
 tests/                  offline checks; not part of the installed package
-  suite.py              the 215 checks
+  suite.py              the 225 checks
   scenario.py           synthetic two-region demo scenario
   fake_aws.py           boto3 stand-in used by --demo and the suite
 ```
@@ -555,8 +556,12 @@ Conventions the code holds to:
   name, so two clusters or services that share a name cannot overwrite each other
   in the workloads map. The self-test asserts ids are unique.
 - **Nodes are rendered, never inferred.** `graph/connectivity.py` decides the
-  topology; `render/mermaid.py` decides only how it looks. A rendering concern
-  never requires touching path evaluation.
+  topology; `render/` decides only how it looks. A rendering concern never
+  requires touching path evaluation.
+- **One row per workload kind.** Label, node shape and detail lines all live in
+  `render/kinds.py`, so a kind cannot render half-configured. A collector that
+  introduces a kind the registry has no row for fails the self-test rather than
+  drawing a node nobody reviewed.
 - **Deterministic output.** Subgraph ids come from a counter, not `hash()`,
   because Python randomizes string hashes per process. The same inventory yields
   a byte-identical file.
@@ -579,6 +584,7 @@ Each layer has one job, so a change belongs in exactly one place:
 | A new finding | a `@rule`-decorated function in `rules/` | It registers itself; the registry and the report pick it up |
 | A new way to resolve a path | `graph/routing.py` | `connectivity.py` and the diagram follow automatically |
 | A new diagram element or layout tweak | `render/mermaid.py` | No path evaluation changes |
+| A new workload kind | `render/kinds.py` (one row) | The self-test fails until the row exists |
 | A new CSV or report file | `render/reports.py` | Add the filename to the `report_files` list |
 | A new CLI flag | `cli.py` (`build_parser` + the run path) | Document it in the CLI section above |
 | A new check | `tests/suite.py` | No wiring; `run_self_test` discovers it |
@@ -590,7 +596,7 @@ The dependency direction is one-way: `discovery → model`, then
 ### Running the checks
 
 ```bash
-python3 run_tests.py                    # the 215 offline checks
+python3 run_tests.py                    # the 225 offline checks
 python3 aws_network_mapper.py --demo --reports --out ./demo   # no AWS access
 python3 aws_network_mapper.py --all-regions --out ./map       # live, read-only
 ```

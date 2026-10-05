@@ -566,6 +566,58 @@ def run_self_test(verbose: bool = True) -> int:
             and "#35;" in diagrams["tricky-labels"] and "#lt;" in diagrams["tricky-labels"],
             diagrams["tricky-labels"])
 
+        # Every collected kind must have a presentation row in render/kinds.py.
+    # Before the registry this could not be asserted: a kind could have a title
+    # but no shape and no detail lines and still render, because each of those
+    # was a separate chain with its own default. An ECS cluster was exactly that
+    # case, and nothing failed.
+    from mapper import discovery as _discovery
+    from mapper.model import Workload as _Workload
+    from mapper.render import kinds as kind_styles
+
+    collected_kinds = {wl.kind for wl in topo.workloads.values()}
+    c.check("every collected workload kind has a presentation row",
+            not kind_styles.unstyled_kinds(collected_kinds),
+            str(kind_styles.unstyled_kinds(collected_kinds)))
+
+    # Static scan: catches a new collector that emits a kind nobody has drawn
+    # yet, which the fixture-based check above cannot see.
+    _disc_src = open(_discovery.__file__, encoding="utf-8").read()
+    _emitted = set(re.findall(r'kind="([a-z0-9-]+)"', _disc_src))
+    c.check("every kind the collector can emit has a presentation row",
+            not kind_styles.unstyled_kinds(_emitted),
+            f"collector emits {sorted(_emitted)}; missing "
+            f"{kind_styles.unstyled_kinds(_emitted)}")
+
+    # Load balancer kinds come from a declared map, not a kind="" literal.
+    # gwlb and lb are real and producible: gwlb when a gateway load balancer
+    # exists, lb as the fallback for an unrecognised Type. The fixture happens
+    # to contain neither, so they would otherwise look dead.
+    _lb_kinds = set(_discovery.LB_KIND_BY_TYPE.values()) | {_discovery.DEFAULT_LB_KIND}
+    c.check("the collector declares the load balancer kinds it can emit",
+            {"alb", "nlb", "gwlb"} <= _lb_kinds, str(sorted(_lb_kinds)))
+    c.check("every kind in the collector's declared map has a presentation row",
+            not kind_styles.unstyled_kinds(_lb_kinds), str(kind_styles.unstyled_kinds(_lb_kinds)))
+    _producible = _emitted | _lb_kinds
+    c.check("no presentation row is dead",
+            not (set(kind_styles.KIND_STYLES) - _producible),
+            f"unreachable rows {sorted(set(kind_styles.KIND_STYLES) - _producible)}")
+
+    _novel = _Workload(kind="brand-new-service", name="thing", id="x-1", region="eu-west-1")
+    _fallback = kind_styles.style_for("brand-new-service")
+    c.check("an unstyled kind falls back to an upper-cased label, not an empty one",
+            _fallback.title(_novel) == "BRAND-NEW-SERVICE", _fallback.title(_novel))
+    c.check("a styled kind ignores the kind string and uses its label",
+            kind_styles.style_for("ecs-service").title(
+                _Workload(kind="ecs-service", name="api", id="s-1", region="eu-west-1")
+            ) == "ECS SERVICE", "ecs-service label")
+    c.check("an unstyled kind still renders a node shape", _fallback.shape == "box")
+    c.check("an unstyled kind gets no invented detail lines", _fallback.detail(_novel) == [])
+    c.check("load balancers are the only kinds that suppress the private IP line",
+            {k for k, v in kind_styles.KIND_STYLES.items() if not v.shows_ip}
+            == {"alb", "nlb", "gwlb", "lb"},
+            str(sorted(k for k, v in kind_styles.KIND_STYLES.items() if not v.shows_ip)))
+
     # Regression: mermaid does not accept a bare "->" or "-.-" as a link. It lexes
     # them as MINUS and fails with "got 'MINUS'". These spell out the real report.
     c.check("every emitted link style is a real mermaid link token",
