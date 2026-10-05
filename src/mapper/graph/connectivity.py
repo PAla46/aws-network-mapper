@@ -36,7 +36,7 @@ One arrow per journey
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .. import model as M
 from ..util.cidr import ip_in_net, is_default_route, parse_net
@@ -118,7 +118,6 @@ class SubnetRouting:
     rtb_name: str = ""
     classification: str = ISOLATED
     default_route: Optional[M.Route] = None
-    default_target_kind: str = ""
     egress: List[M.Route] = field(default_factory=list)
     hazards: List[M.Route] = field(default_factory=list)
 
@@ -129,22 +128,6 @@ class SubnetRouting:
         for route in self.hazards:
             out.append(route_label(route))
         return out
-
-    @property
-    def default_summary(self) -> str:
-        if self.default_route is None:
-            return "no default route"
-        return route_label(self.default_route)
-
-    @property
-    def egress_summary(self) -> str:
-        if not self.egress:
-            return ""
-        parts = [route_label(r) for r in self.egress[:3]]
-        extra = len(self.egress) - len(parts)
-        if extra > 0:
-            parts.append(f"+{extra} more")
-        return "\n".join(parts)
 
 
 def classify_subnet(topo: Topology, subnet: M.Subnet) -> SubnetRouting:
@@ -169,7 +152,6 @@ def classify_subnet(topo: Topology, subnet: M.Subnet) -> SubnetRouting:
 
     if info.default_route is not None:
         kind = target_kind(info.default_route)
-        info.default_target_kind = kind
         info.classification = PUBLIC if kind == "igw" else PRIVATE
 
     info.hazards = [
@@ -274,9 +256,6 @@ class FlowModel:
 
     def routing_for(self, subnet_id: str) -> SubnetRouting:
         return self.routing.get(subnet_id) or SubnetRouting(subnet_id=subnet_id)
-
-    def edges_from(self, node_id: str) -> List[FlowEdge]:
-        return [e for e in self.edges if e.src == node_id]
 
 
 # ---------------------------------------------------------------------------

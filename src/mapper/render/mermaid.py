@@ -7,7 +7,7 @@ node ids and escapes labels, so generated files always parse.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 from . import kinds
 from .. import model as M
@@ -146,9 +146,6 @@ class MermaidBuilder:
         self._edges.add(body)
         self._lines.append(body)
 
-    def link_nodes(self, src_key: str, dst_key: str, **kwargs) -> None:
-        self.edge(src_key, dst_key, **kwargs)
-
     # -- subgraphs -------------------------------------------------------
     def subgraph(self, key: str, label: str) -> "_Subgraph":
         return _Subgraph(self, key, label)
@@ -158,9 +155,6 @@ class MermaidBuilder:
 
     def free(self, line: str) -> None:
         self._lines.append(line)
-
-    def legend(self, pairs: Sequence[Tuple[str, str]]) -> None:
-        self._lines.append("  %% legend: " + "; ".join(f"{k} = {v}" for k, v in pairs))
 
     # -- render ----------------------------------------------------------
     def render(self) -> str:
@@ -204,23 +198,6 @@ class _Subgraph:
 # --------------------------------------------------------------------------- #
 
 
-def _sg_ingress_summary(topo: Topology, sg_ids: Sequence[str], limit: int = 3) -> List[str]:
-    """Human-readable ingress rules, the thing that decides if a flow is allowed."""
-    out: List[str] = []
-    for sg_id in sg_ids:
-        sg = topo.security_groups.get(sg_id)
-        if not sg:
-            continue
-        name = sg.name or sg.id
-        for rule in sg.ingress[:limit]:
-            src = rule.cidr or (f"sg {rule.sg_id}" if rule.sg_id else "any")
-            proto = rule.protocol.upper() if rule.protocol not in ("-1", "all") else "any"
-            out.append(f"{name}: {proto} {rule.port_range} from {src}")
-        if len(sg.ingress) > limit:
-            out.append(f"{name}: +{len(sg.ingress) - limit} more")
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # THE single topology diagram
 # --------------------------------------------------------------------------- #
@@ -237,7 +214,6 @@ def _sg_ingress_summary(topo: Topology, sg_ids: Sequence[str], limit: int = 3) -
 # it appears in the label of an intra-VPC arrow.
 
 MAX_TOPOLOGY_SUBNETS = 400
-MAX_SG_RULES = 2
 
 CLASS_ORDER = {"public": 0, "private": 1, "isolated": 2}
 

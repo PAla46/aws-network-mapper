@@ -21,8 +21,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from .. import model as M
 from ..model import AccountSnapshot
 
-DEFAULT_CACHE_VERSION = 1
-
 
 class CollectorError(Exception):
     pass
@@ -155,8 +153,6 @@ class Cache:
     def __init__(self, root: Optional[str], enabled: bool = True):
         self.root = root
         self.enabled = enabled and bool(root)
-        self.hits = 0
-        self.writes = 0
 
     def path(self, region: str, key: str) -> Optional[str]:
         if not self.enabled:
@@ -170,7 +166,6 @@ class Cache:
             return None
         try:
             with open(p, "r", encoding="utf-8") as fh:
-                self.hits += 1
                 return json.load(fh)
         except (OSError, ValueError):
             return None
@@ -185,7 +180,6 @@ class Cache:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(value, fh, default=str)
             os.replace(tmp, p)
-            self.writes += 1
         except (OSError, TypeError):
             pass
 
@@ -405,7 +399,6 @@ class Collector:
         ]
         if not tgws:
             return []
-        tgw_ids = [t.id for t in tgws]
 
         atts = self._call(
             region,
@@ -1242,9 +1235,3 @@ def infer_eni_owner(eni: M.Eni, snap: AccountSnapshot) -> Tuple[str, str, str]:
     if eni.requester_managed:
         return "aws-managed-eni", eni.id, eni.id
     return "unknown", eni.id, eni.id
-
-
-def merge_snapshots(snaps: List[AccountSnapshot]) -> List[AccountSnapshot]:
-    """Collapse per-region snapshots that share a VPC set is not valid, so we
-    keep them separate and let callers index by (region, vpc)."""
-    return [s for s in snaps if s.region]

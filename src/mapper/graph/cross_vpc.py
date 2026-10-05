@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .. import model as M
-from ..model import Eni, Subnet, Vpc, Workload
+from ..model import Subnet
 from ..util.cidr import parse_net
 from . import Topology
-from .routing import PathEngine, PathResult
+from .routing import PathEngine
 
 
 def link_key(a: str, b: str) -> Tuple[str, str]:

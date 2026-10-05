@@ -8,7 +8,7 @@ or pasted into an audit report.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from .. import model as M
 from ..util.cidr import (
@@ -16,9 +16,8 @@ from ..util.cidr import (
     longest_prefix_match,
     nets_overlap,
     parse_ip,
-    parse_net,
 )
-from ..model import Eni, Route, RouteTable, Subnet, Vpc, Workload
+from ..model import Route, RouteTable, Subnet
 from . import Topology
 
 # verdicts
@@ -116,7 +115,6 @@ class PathEngine:
     ) -> PathResult:
         src_subnet = self.t.subnets.get(src_subnet_id)
         dst_subnet = self.t.subnets.get(dst_subnet_id) or None
-        src_vpc_id = src_subnet.vpc_id if src_subnet else ""
         res = PathResult(src=src_ip, dst=dst_ip)
         res.add("source", src_subnet_id, src_subnet.name if src_subnet else src_subnet_id, src_ip)
 
@@ -673,11 +671,9 @@ class PathEngine:
             eni = self.t.eni_for_ip(dst_ip)
             if eni:
                 dst_sg_ids = eni.sg_ids
-        egress_ok, egress_why = self._sg_side(
-            src_sg_ids, src_ip, dst_ip, port, egress=True
-        )
+        egress_ok, egress_why = self._sg_side(src_sg_ids, dst_ip, port, egress=True)
         ingress_ok, ingress_why = self._sg_side(
-            list(dst_sg_ids), dst_ip, src_ip, port, egress=False
+            list(dst_sg_ids), src_ip, port, egress=False
         )
         parts = []
         if egress_ok is False:
@@ -703,7 +699,6 @@ class PathEngine:
     def _sg_side(
         self,
         sg_ids: Sequence[str],
-        self_ip: str,
         peer_ip: str,
         port: int,
         egress: bool,

@@ -18,7 +18,6 @@ T_TGW = "transit-gateway"
 T_TGW_ATTACH = "transit-gateway-attachment"
 T_PEERING = "vpc-peering"
 T_VGW = "vpn-gateway"
-T_VGW_ATTACH = "vpn-connection"
 T_EIGW = "egress-only-internet-gateway"
 T_ENDPOINT = "vpc-endpoint"
 T_CARRIER_GW = "carrier-gateway"
@@ -27,8 +26,6 @@ T_CORE_NETWORK = "core-network"
 T_ENI = "network-interface"
 T_INSTANCE = "instance"
 T_UNKNOWN = "unknown"
-
-INTERNET_KINDS = {T_INTERNET, T_EIGW}
 
 TARGET_FIELD_MAP = (
     ("GatewayId", None),
@@ -61,23 +58,8 @@ def gateway_id_kind(gateway_id: str) -> str:
     return T_UNKNOWN
 
 
-def tag_name(tags: Optional[List[Dict[str, str]]], fallback: str = "") -> str:
-    for t in tags or []:
-        if t.get("Key") == "Name":
-            return t.get("Value") or fallback
-    return fallback
-
-
 def _tags_dict(tags: Optional[List[Dict[str, str]]]) -> Dict[str, str]:
     return {t.get("Key", ""): t.get("Value", "") for t in tags or []}
-
-
-@dataclass
-class Region:
-    name: str
-
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return self.name
 
 
 @dataclass
@@ -110,7 +92,6 @@ class Subnet:
     rtb_association: str = ""  # explicit | main | none
     map_public_ip_on_launch: bool = False
     available_ips: int = 0
-    default_for_az: bool = False
     tags: Dict[str, str] = field(default_factory=dict)
 
     @property
@@ -156,7 +137,7 @@ class RouteTable:
 
     def route_for(self, ip: str) -> Optional[Route]:
         """Longest-prefix-match route for *ip* (pure table lookup)."""
-        from ..util.cidr import longest_prefix_match, parse_net
+        from ..util.cidr import longest_prefix_match
 
         dest = longest_prefix_match((r.destination for r in self.routes), ip)
         if dest is None:
@@ -248,9 +229,6 @@ class Tgw:
     @property
     def label(self) -> str:
         return self.name or self.id
-
-    def attachments_for(self, resource_id: str) -> List[TgwAttachment]:
-        return [a for a in self.attachments if a.resource_id == resource_id]
 
 
 @dataclass

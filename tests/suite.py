@@ -14,7 +14,6 @@ import shutil
 import tempfile
 from typing import Any, Dict, List
 
-from mapper.discovery import Collector
 from mapper.graph import Topology
 from mapper.graph import connectivity as flow
 from mapper.graph import cross_vpc as analysis
@@ -24,10 +23,6 @@ from mapper.rules import run_rules
 
 from .fake_aws import FakePool, FixtureCollector
 from .scenario import build_fixtures
-
-
-class CheckFailed(AssertionError):
-    pass
 
 
 class Checker:
@@ -61,14 +56,6 @@ EDGE_RE = re.compile(
 BAD_LINK_RE = re.compile(r"(?<![\w\"\[({|])(-+>|-+\.|-+\.[-.]+)(?![\w\"\[({|])")
 CLASS_RE = re.compile(r"^\s*class\s+(n\d+)\s")
 SUBGRAPH_RE = re.compile(r"^\s*subgraph\s+(sg\d+)\[")
-LABEL_RE = re.compile(r'(["\[])("(?:[^"\\]|\\.)*")\s*[\])]}')
-
-
-def _line_matching(text: str, needle: str) -> str:
-    for raw in text.splitlines():
-        if needle in raw and any(t in raw for t in ("-->", "-.->", "==>", "<-.->")):
-            return raw.strip()
-    return ""
 
 
 def _invalid_styles(diagrams: Dict[str, str]) -> List[str]:
@@ -542,7 +529,6 @@ def run_self_test(verbose: bool = True) -> int:
     # Structural reference integrity: every node an arrow mentions must be
     # declared by a node statement, or Mermaid drops the arrow.
     declared = set(re.findall(r"^\s*(n\d+)[\[({]", t, re.M))
-    mentioned = set(re.findall(r"\b(n\d+)\b", t))
     arrow_targets = set()
     for line in t.splitlines():
         mm = re.match(r"^\s*(n\d+)\s*-->\|?[^|]*\|?\s*(n\d+)", line)

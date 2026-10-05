@@ -443,7 +443,6 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
             by_rule.setdefault(f.rule_id, []).append(f.resource)
         lines += ["| Rule | Severity | Resources |", "| --- | --- | --- |"]
         sev = {f.rule_id: f.severity for f in findings}
-        title = {f.rule_id: f.title for f in findings}
         for rule_id in sorted(by_rule):
             res = ", ".join(f"`{r}`" for r in sorted(set(by_rule[rule_id]))[:6])
             more = len(set(by_rule[rule_id])) - 6

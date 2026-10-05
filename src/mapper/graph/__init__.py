@@ -168,21 +168,11 @@ class Topology:
             chosen.requester_managed = True
 
     # -- lookups ---------------------------------------------------------
-    def vpc_of_subnet(self, subnet_id: str) -> Optional[Vpc]:
-        subnet = self.subnets.get(subnet_id)
-        return self.vpcs.get(subnet.vpc_id) if subnet else None
-
     def rtb_for_subnet(self, subnet_id: str) -> Optional[RouteTable]:
         subnet = self.subnets.get(subnet_id)
         if not subnet or not subnet.rtb_id:
             return None
         return self.route_tables.get(subnet.rtb_id)
-
-    def main_rtb_for_vpc(self, vpc_id: str) -> Optional[RouteTable]:
-        for rt in self.rtbs_by_vpc.get(vpc_id, []):
-            if rt.is_main:
-                return rt
-        return None
 
     def default_nacl_for(self, subnet: Subnet) -> Optional[M.Nacl]:
         candidates = [n for n in self.nacls.values() if n.is_default and n.vpc_id == subnet.vpc_id]
@@ -208,9 +198,6 @@ class Topology:
 
     def eni_for_ip(self, ip: str) -> Optional[Eni]:
         return self.enis_by_ip.get(ip)
-
-    def subnets_for_cidr(self, cidr: str) -> List[Subnet]:
-        return [s for s in self.subnets.values() if nets_overlap(s.cidr, cidr)]
 
     def nat_in_subnet(self, subnet_id: str) -> Optional[M.NatGw]:
         for n in self.nat_gateways.values():
@@ -258,9 +245,6 @@ class Topology:
             if eni.primary:
                 return eni
         return enis[0] if enis else None
-
-    def security_groups_for(self, sg_ids: Iterable[str]) -> List[SecurityGroup]:
-        return [self.security_groups[s] for s in sg_ids if s in self.security_groups]
 
     # -- helpers ---------------------------------------------------------
     def vpcs_overlapping(self, vpc_id: str) -> List[Vpc]:

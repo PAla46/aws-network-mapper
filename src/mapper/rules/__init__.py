@@ -7,7 +7,6 @@ AWS APIs, and every finding carries evidence so a reviewer can reproduce it.
 from __future__ import annotations
 
 import itertools
-import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -15,9 +14,7 @@ from .. import model as M
 from ..util.cidr import (
     cidr_contains,
     is_default_route,
-    ip_in_net,
     nets_overlap,
-    parse_ip,
 )
 from ..graph import Topology
 from ..model import Route, RouteTable, Subnet, Vpc
@@ -1069,31 +1066,6 @@ def describe_vpc_paths(ctx: RuleContext, vpc_a: str, vpc_b: str) -> str:
         if pcx.peer_vpc_id == vpc_b and pcx.status == "active":
             paths.append(f"vpc peering {pcx.id}")
     return ", ".join(sorted(set(paths)))
-
-
-def tgw_route_matches(rtb: M.TgwRouteTable, src_cidrs: List[str], dst_cidrs: List[str]) -> bool:
-    if not src_cidrs or not dst_cidrs:
-        return False
-    for src in src_cidrs:
-        net = parse_ip(src.split("/")[0])
-        if net is None:
-            continue
-        dest = None
-        best = -1
-        for route in rtb.routes:
-            if route.state != "active":
-                continue
-            if not ip_in_net(str(net), route.destination):
-                continue
-            length = int(route.destination.split("/")[-1])
-            if length > best:
-                best = length
-                dest = route
-        if dest is None:
-            continue
-        if any(cidr_contains(dest.destination, d) or nets_overlap(dest.destination, d) for d in dst_cidrs):
-            return True
-    return False
 
 
 for _rid, _fn in RULES.items():
