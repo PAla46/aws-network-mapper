@@ -10,7 +10,18 @@ import re
 from typing import Dict, List, Optional, Set
 
 from . import kinds
-from .. import model as M
+from .scene import (
+    PALETTE,
+    Style,
+    classification_reason as _classification_reason,
+    component_node_ids as _component_node_ids,
+    known_node_ids as _known_node_ids,
+    nacl_counts as _nacl_counts,
+    service_short as _service_short,
+    short_id as _short_id,
+    short_sg_list as _short_sg_list,
+    workload_title as _workload_title,
+)
 from ..graph import connectivity as flow
 from ..graph import Topology
 from ..model import Subnet, Workload
@@ -29,23 +40,23 @@ ESCAPES = {
     ";": "#59;",
 }
 
-CLASSES = {
-    "internet": ("fill:#dbeafe,stroke:#1d4ed8,color:#0f172a",),
-    "igw": ("fill:#bfdbfe,stroke:#1d4ed8,color:#0f172a",),
-    "nat": ("fill:#cffafe,stroke:#0e7490,color:#0f172a",),
-    "tgw": ("fill:#ede9fe,stroke:#6d28d9,color:#1e1b4b",),
-    "peering": ("fill:#f5d0fe,stroke:#a21caf,color:#3b0764",),
-    "vgw": ("fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b",),
-    "endpoint": ("fill:#ccfbf1,stroke:#0f766e,color:#042f2e",),
-    "public": ("fill:#fed7aa,stroke:#c2410c,color:#431407",),
-    "private": ("fill:#e2e8f0,stroke:#475569,color:#0f172a",),
-    "data": ("fill:#dcfce7,stroke:#15803d,color:#052e16",),
-    "rtb": ("fill:#f1f5f9,stroke:#64748b,color:#0f172a,stroke-dasharray:4 3",),
-    "onprem": ("fill:#e7e5e4,stroke:#57534e,color:#1c1917",),
-    "blocked": ("fill:#fee2e2,stroke:#b91c1c,color:#450a0a",),
-    "warn": ("stroke-dasharray:4 3",),
-    "component": ("fill:#e2e8f0,stroke:#334155,color:#0f172a",),
-}
+def _mermaid_style(style: Style) -> str:
+    """A shared palette row rendered as a Mermaid ``classDef`` body."""
+    parts = []
+    if style.fill:
+        parts.append(f"fill:{style.fill}")
+    if style.stroke:
+        parts.append(f"stroke:{style.stroke}")
+    if style.text:
+        parts.append(f"color:{style.text}")
+    if style.dashed:
+        parts.append("stroke-dasharray:4 3")
+    return ",".join(parts)
+
+
+# Mermaid's view of the shared palette. Derived once so ``render`` and the
+# membership tests ("is this a known class?") keep working unchanged.
+CLASSES = {name: (_mermaid_style(style),) for name, style in PALETTE.items()}
 
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -216,39 +227,6 @@ class _Subgraph:
 MAX_TOPOLOGY_SUBNETS = 400
 
 CLASS_ORDER = {"public": 0, "private": 1, "isolated": 2}
-
-
-def _known_node_ids(topo: Topology) -> Set[str]:
-    """Every node id the topology could legitimately produce, drawn or not."""
-    ids: Set[str] = {flow.internet_node(), flow.onprem_node()}
-    ids.update(flow.sid(s.id) for s in topo.subnets.values())
-    ids.update(flow.wid(w.id) for w in topo.workloads.values())
-    for kind, coll in (
-        ("igw", topo.igws), ("nat", topo.nat_gateways), ("tgw", topo.tgws),
-        ("pcx", topo.peerings), ("vpce", topo.endpoints), ("vgw", topo.vpn_gateways),
-    ):
-        ids.update(flow.nid(kind, r.id) for r in coll.values())
-    ids.update(flow.nid("eni", e.id) for e in topo.enis.values())
-    return ids
-
-
-def _component_node_ids(topo: Topology) -> Set[str]:
-    """Node ids for network-path components that must never be omitted.
-
-    Section 14: when a diagram is over budget we shed subnet headers and
-    workload detail, never the gateways and NAT devices that a route arrow
-    points at. Hiding those would turn "this path exists" into "I could not
-    draw this path", which is a very different claim.
-    """
-    ids: Set[str] = set()
-    for kind, coll in (
-        ("igw", topo.igws), ("nat", topo.nat_gateways), ("tgw", topo.tgws),
-        ("pcx", topo.peerings), ("vpce", topo.endpoints), ("vgw", topo.vpn_gateways),
-    ):
-        ids.update(flow.nid(kind, r.id) for r in coll.values())
-    ids.add(flow.internet_node())
-    ids.add(flow.onprem_node())
-    return ids
 
 
 def render_topology(
@@ -527,29 +505,6 @@ def _emit_subnet(b, model, topo, vpc, subnet: Subnet, defined: Set[str], owned_e
             _emit_eni(b, topo, eni, defined, owned_eni_ids)
 
 
-def _service_short(service_name: str) -> str:
-    """`com.amazonaws.eu-west-1.ecr.api` -> `ecr.api` (not just `api`)."""
-    parts = [p for p in service_name.split(".") if p]
-    while parts and parts[0] in ("com", "amazonaws") or (parts and parts[0].startswith(("aws-", "us-", "eu-", "ap-", "sa-", "ca-", "me-", "af-", "il-"))):
-        parts.pop(0)
-    return ".".join(parts[-2:]) or service_name
-
-
-def _nacl_counts(nacl: M.Nacl) -> str:
-    inbound = sum(1 for e in nacl.entries if not e.egress)
-    outbound = len(nacl.entries) - inbound
-    return f"{inbound} in / {outbound} out"
-
-
-def _classification_reason(info) -> str:
-    """One line: how this subnet was classified, and the route that proves it."""
-    if info.default_route is None:
-        return "Type: ISOLATED \u2014 no 0.0.0.0/0 route in its route table"
-    kind = flow.target_kind(info.default_route)
-    phrase = flow.TARGET_PHRASE.get(kind, kind)
-    return f"Type: {info.classification.upper()} \u2014 0.0.0.0/0 \u2192 {phrase}"
-
-
 def _emit_workload(
     b,
     model,
@@ -603,31 +558,6 @@ def _emit_workload(
     b.node(node, "\n".join(lines), _workload_shape(wl),
            subnet_class if subnet_class in CLASSES else "private", 320)
     defined.add(node)
-
-
-def _short_id(raw: str) -> str:
-    """Abbreviate a long AWS identifier. Full value stays in the report."""
-    text = raw or ""
-    if text.startswith("arn:"):
-        tail = text.rsplit(":", 1)[-1]
-        parts = [seg for seg in tail.split("/") if seg]
-        if len(parts) >= 2:
-            return f"{parts[0]}/{parts[-1]}"
-        return tail or text
-    return text
-
-
-def _short_sg_list(sg_ids: List[str]) -> str:
-    """Security group ids, abbreviated. Full ids live in the report."""
-    out = []
-    for sg in sg_ids[:2]:
-        out.append(sg if len(sg) <= 24 else sg[:20] + "..")
-    extra = f" (+{len(sg_ids) - 2})" if len(sg_ids) > 2 else ""
-    return ", ".join(out) + extra
-
-
-def _workload_title(wl: Workload) -> str:
-    return f"{kinds.style_for(wl.kind).title(wl)} {wl.name or _short_id(wl.id)}"
 
 
 def _workload_shape(wl: Workload) -> str:
