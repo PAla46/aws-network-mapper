@@ -1,12 +1,14 @@
 """Turning the connectivity model into artefacts.
 
-``mermaid``  the single topology diagram.
+``mermaid``  the single topology diagram, as Mermaid source.
+``d2``       the same diagram as D2 source (opt-in with ``--d2``).
+``scene``    content shared by both renderers: palette, titles, classifications.
 ``reports``  CSV, JSON and Markdown evidence, written only with ``--reports``.
 
-Both are pure functions of a ``Topology`` and the flow model, so re-rendering
-from cache needs no API access.
+Both diagrams are pure functions of a ``Topology`` and the flow model, so
+re-rendering from cache needs no API access.
 """
 
-from . import mermaid, reports  # noqa: F401
+from . import d2, mermaid, reports, scene  # noqa: F401
 
-__all__ = ["mermaid", "reports"]
+__all__ = ["d2", "mermaid", "reports", "scene"]

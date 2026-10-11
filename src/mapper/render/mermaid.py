@@ -11,6 +11,8 @@ from typing import Dict, List, Optional, Set
 
 from . import kinds
 from .scene import (
+    CLASS_ORDER,
+    MAX_TOPOLOGY_SUBNETS,
     PALETTE,
     Style,
     classification_reason as _classification_reason,
@@ -20,6 +22,7 @@ from .scene import (
     service_short as _service_short,
     short_id as _short_id,
     short_sg_list as _short_sg_list,
+    trunc,
     workload_title as _workload_title,
 )
 from ..graph import connectivity as flow
@@ -85,10 +88,6 @@ def esc(text: object) -> str:
         for part in raw.split("\n")
     ]
     return "<br/>".join(l for l in lines if l) or " "
-
-
-def trunc(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
 
 class MermaidBuilder:
@@ -223,11 +222,6 @@ class _Subgraph:
 # NACLs and security groups are never nodes. They are lines inside the label of
 # the container (NACL) or the resource (SG). ``local`` is never a node either --
 # it appears in the label of an intra-VPC arrow.
-
-MAX_TOPOLOGY_SUBNETS = 400
-
-CLASS_ORDER = {"public": 0, "private": 1, "isolated": 2}
-
 
 def render_topology(
     topo: Topology,

@@ -370,6 +370,7 @@ def findings_markdown(findings: Sequence[Finding], topo: Topology) -> str:
 
 def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: Sequence[str]) -> str:
     """The one page to open first: what the diagrams answer, and the findings."""
+    has_d2 = any(str(name).endswith(".d2") for name in diagrams)
     lines = [
         "# Start here",
         "",
@@ -379,10 +380,17 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
         f"route tables {len(topo.route_tables)}, transit gateways {len(topo.tgws)}, "
         f"peerings {len(topo.peerings)}, internet gateways {len(topo.igws)}",
         "",
-        "The tool writes **one** diagram for the whole account. It is Mermaid text:",
+        "The tool writes **one** diagram for the whole account"
+        + (", rendered two ways: as Mermaid, and as D2." if has_d2 else ". It is Mermaid text:"),
         "",
         "```",
         "open https://mermaid.live  and paste network-map/00-network-topology.mmd",
+    ]
+    if has_d2:
+        lines.append(
+            "open https://play.d2lang.com  and paste network-map/00-network-topology.d2"
+        )
+    lines += [
         "```",
         "",
         "## The one diagram",
@@ -392,6 +400,15 @@ def start_here_markdown(topo: Topology, findings: Sequence[Finding], diagrams: S
         "| `00-network-topology.mmd` | The complete AWS network: external networks, gateways, "
         "then nested `AWS Account > VPC > Availability Zone > Subnet` containers holding the "
         "resources that live there. |",
+    ]
+    if has_d2:
+        lines.append(
+            "| `00-network-topology.d2` | The same account in D2. D2 lets *you* pick the layout "
+            "engine (`--layout=elk|dagre|tala`), which helps on very large, deeply nested graphs "
+            "where Mermaid crowds. It is text only -- render it at play.d2lang.com or with the "
+            "`d2` binary; neither is needed to produce it. |"
+        )
+    lines += [
         "",
         "How to read it:",
         "",

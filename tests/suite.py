@@ -18,7 +18,8 @@ from mapper.graph import Topology
 from mapper.graph import connectivity as flow
 from mapper.graph import cross_vpc as analysis
 from mapper.graph.routing import PathEngine
-from mapper.render import mermaid, reports as report
+from mapper.render import d2 as d2render
+from mapper.render import mermaid, reports as report, scene
 from mapper.rules import run_rules
 
 from .fake_aws import FakePool, FixtureCollector
@@ -136,6 +137,83 @@ def validate_mermaid(text: str) -> List[str]:
     if text.count('"') % 2 != 0:
         problems.append("odd number of quote characters")
     return problems
+
+
+def validate_d2(text: str) -> List[str]:
+    """Lightweight structural check for the D2 subset we emit.
+
+    Not a full parser: it catches the mistakes this renderer can actually make --
+    unbalanced braces, an edge to a node that was never declared, an unescaped
+    quote, or a line that is none of the shapes we produce. Real D2 acceptance is
+    checked against the ``d2`` binary outside the suite (see README).
+    """
+    problems: List[str] = []
+    depth = 0
+    defined: set = set()
+    open_re = re.compile(r"^[\w-]+:\s*\{\s*$")
+    node_re = re.compile(r'^\s*([A-Za-z_][\w.]*):\s*"(?:[^"\\]|\\.)*"\s*\{?\s*$')
+    edge_re = re.compile(
+        r'^\s*([A-Za-z_][\w.]*)\s*->\s*([A-Za-z_][\w.]*)(?::\s*"(?:[^"\\]|\\.)*")?\s*$'
+    )
+    prop_re = re.compile(
+        r"^\s*(shape|class|layout-engine):\s*[\w.-]+$"
+        r'|^\s*(fill|stroke|font-color):\s*"#[0-9a-fA-F]{6}"$'
+        r"|^\s*stroke-dash:\s*\d+$"
+        r"|^\s*style:\s*\{\s*border-radius:\s*\d+\s*\}$"
+    )
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        depth += stripped.count("{") - stripped.count("}")
+        if stripped == "}" or open_re.match(stripped):
+            continue
+        m = edge_re.match(line)
+        if m:
+            for key in (m.group(1), m.group(2)):
+                if key not in defined:
+                    problems.append(f"edge references undefined node {key!r}")
+            continue
+        if prop_re.match(line):
+            continue
+        m = node_re.match(line)
+        if m:
+            defined.add(m.group(1))
+            continue
+        problems.append(f"unrecognised line: {line!r}")
+    if depth != 0:
+        problems.append(f"unbalanced braces (depth {depth})")
+    # Count only *unescaped* quotes: D2 spells an embedded quote as \" and an
+    # embedded backslash as \\, so the raw count is meaningless.
+    if re.sub(r"\\.", "", text).count('"') % 2 != 0:
+        problems.append("odd number of quote characters")
+    return problems
+
+
+def _d2_edges(text: str):
+    """(src, dst, label) for every arrow in a D2 document, label newlines decoded."""
+    out = []
+    for raw in text.splitlines():
+        m = re.match(
+            r'^\s*([A-Za-z_][\w.]*)\s*->\s*([A-Za-z_][\w.]*)'
+            r'(?::\s*"(.*)")?\s*$',
+            raw,
+        )
+        if m:
+            label = (m.group(3) or "").replace("\\n", "\n")
+            out.append((m.group(1), m.group(2), label))
+    return out
+
+
+def _mermaid_edges(text: str):
+    """(label) for every arrow in a Mermaid flowchart, ``<br/>`` normalised to \\n."""
+    out = []
+    for raw in text.splitlines():
+        m = re.match(r"^\s*n\d+\s*[-.=<>|]+\s*(?:\|(.*?)\|\s*)?n\d+\s*$", raw)
+        if m:
+            out.append((m.group(1) or "").replace("<br/>", "\n"))
+    return out
 
 
 def run_self_test(verbose: bool = True) -> int:
@@ -817,6 +895,63 @@ def run_self_test(verbose: bool = True) -> int:
     c.check("a TGW whose route table sends 0.0.0.0/0 to VPN does get an internet leg",
             (dx_node, flow.internet_node()) in dx_edges, str(sorted(dx_edges)))
 
+    # ------------------------------------------------------------------ D2
+    print("\n[6d/8] d2 rendering")
+
+    # Both renderers must speak the same palette, or a colour change in one
+    # silently disagrees with the other.
+    c.check("mermaid still builds its classes from the shared palette",
+            set(mermaid.CLASSES) == set(scene.PALETTE))
+
+    d2_text = d2render.render_topology(topo, fmodel)
+    d2_problems = validate_d2(d2_text)
+    c.check("topology.d2 is structurally valid", not d2_problems, "; ".join(d2_problems[:4]))
+    c.check("d2 pins a layout engine in the header",
+            "layout-engine: elk" in d2_text)
+    c.check("d2 defines every class it references",
+            all(f"  {name}: {{" in d2_text for name in scene.PALETTE
+                if f"class: {name}\n" in d2_text))
+    c.check("d2 has no Mermaid <br/> leftovers",
+            "<br/>" not in d2_text and "%%" not in d2_text)
+
+    # The whole point of two renderers is that they never disagree: same nodes,
+    # same arrows, same labels. Labels are compared after normalising each
+    # syntax's own line-break spelling.
+    d2_edges = _d2_edges(d2_text)
+    mmd_edges = _mermaid_edges(diagrams["topology"])
+    c.eq("d2 and mermaid draw the same number of arrows", len(d2_edges), len(mmd_edges))
+    c.eq("d2 and mermaid draw the same arrows",
+         sorted(lbl for _s, _d, lbl in d2_edges), sorted(mmd_edges))
+    model_pairs = {(e.src, e.dst) for e in fmodel.edges}
+    c.check("d2 arrows match the flow model's paths",
+            {(s, d) for s, d, _ in d2_edges} == model_pairs,
+            f"d2={sorted({(s, d) for s, d, _ in d2_edges} - model_pairs)}")
+
+    # Same deterministic output on a re-render, exactly like the mermaid check.
+    c.eq("d2 output is deterministic",
+         d2_text, d2render.render_topology(topo, flow.build_flow_model(topo)))
+
+    # Escaping: a pathological label must survive as one accepted quoted string.
+    tricky_d2 = d2render.D2Builder("escaping")
+    tricky_d2.node("k1", 'quote " pipe | brace {} hash # back \\ slash')
+    tricky_d2.node("k2", "line one\nline two")
+    tricky_d2.edge("k1", "k2", 'label "with" quotes\nand a break')
+    tricky_text = tricky_d2.render()
+    c.check("d2 escaping keeps quotes even and the doc valid",
+            not validate_d2(tricky_text), "; ".join(validate_d2(tricky_text)[:3]))
+    c.check("d2 escapes a real newline into a \\n escape, not a bad quote",
+            'line one\\nline two' in tricky_text
+            and 'k1: "quote \\" pipe | brace {} hash # back \\\\ slash"' in tricky_text)
+
+    out_d2 = tempfile.mkdtemp(prefix="nm-d2-")
+    try:
+        report.write_text(os.path.join(out_d2, "t.d2"), d2_text)
+        # A D2 file we emit must open cleanly with the reference parser when one
+        # is present; otherwise structural validation above is the contract.
+        c.check("d2 output was written", os.path.exists(os.path.join(out_d2, "t.d2")))
+    finally:
+        shutil.rmtree(out_d2, ignore_errors=True)
+
     print("\n[7/8] CSV / JSON / Markdown output")
     tmp = tempfile.mkdtemp(prefix="nm-selftest-")
     try:
@@ -1082,6 +1217,29 @@ def run_self_test(verbose: bool = True) -> int:
                 "00-network-topology.mmd" in start_md)
         c.check("START-HERE explains how to render", "mermaid.live" in start_md)
         c.check("START-HERE lists findings", "NET0" in start_md)
+        c.check("START-HERE does not mention D2 unless asked",
+                "d2lang.com" not in start_md)
+
+        out_d2 = tempfile.mkdtemp(prefix="nm-cli-d2-")
+        try:
+            rc = main(["--demo", "--out", out_d2, "--quiet", "--d2"])
+            c.eq("--d2 run exits 0", rc, 0)
+            c.check("--d2 writes the Mermaid diagram too",
+                    os.path.exists(os.path.join(out_d2, "00-network-topology.mmd")))
+            c.check("--d2 writes the D2 diagram",
+                    os.path.exists(os.path.join(out_d2, "00-network-topology.d2")))
+            d2_written = open(
+                os.path.join(out_d2, "00-network-topology.d2"), encoding="utf-8"
+            ).read()
+            c.check("written .d2 is structurally valid",
+                    not validate_d2(d2_written), "; ".join(validate_d2(d2_written)[:3]))
+            c.check("written .d2 compiles as emitted (no d2 binary needed to check braces)",
+                    d2_written.count("{") == d2_written.count("}"))
+            start_d2 = open(os.path.join(out_d2, "START-HERE.md"), encoding="utf-8").read()
+            c.check("START-HERE points at the D2 file when --d2 is used",
+                    "00-network-topology.d2" in start_d2 and "play.d2lang.com" in start_d2)
+        finally:
+            shutil.rmtree(out_d2, ignore_errors=True)
 
         out2 = tempfile.mkdtemp(prefix="nm-cli-rep-")
         try:

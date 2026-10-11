@@ -15,6 +15,7 @@ from .graph import Topology, connectivity as flow
 from .graph import cross_vpc as analysis
 from .graph.routing import PathEngine
 from .model import AccountSnapshot
+from .render import d2 as d2render
 from .render import mermaid
 from .render import reports as report
 from .rules import Finding, run_rules
@@ -71,7 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also write CSV/JSON/Markdown evidence (off by default)",
     )
-    parser.add_argument("--no-diagrams", action="store_true", help="skip Mermaid diagrams")
+    parser.add_argument("--no-diagrams", action="store_true", help="skip diagrams")
+    parser.add_argument(
+        "--d2",
+        action="store_true",
+        help="also write the topology as D2 text (00-network-topology.d2)",
+    )
     parser.add_argument(
         "--no-rules",
         action="store_true",
@@ -281,11 +287,18 @@ def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger)
     "routing" companion diagram: containers carry location, arrows carry traffic
     paths, and security controls ride along as label metadata.
 
+    The same picture is emitted as Mermaid, and -- with ``--d2`` -- as D2 text
+    from the identical flow model, so the two can never drift apart. D2 is text
+    only on purpose: rendering it needs a binary or the playground, and this runs
+    on CloudShell where neither is available.
+
     Returns ``(written_names, flow_model)``. The diagram itself stays pure
     architecture -- no totals, no summary node -- so the numbers the model holds
     are reported on the console instead, here.
     """
     model = flow.build_flow_model(topo)
+    names: List[str] = []
+
     content = mermaid.render_topology(
         topo,
         model,
@@ -294,12 +307,25 @@ def write_diagrams(topo: Topology, findings, out_dir: str, args, logger: Logger)
     )
     name = "00-network-topology.mmd"
     report.write_text(os.path.join(out_dir, name), content)
+    names.append(name)
+
+    if args.d2:
+        content = d2render.render_topology(
+            topo,
+            model,
+            max_vpcs=args.max_diagram_vpcs,
+            max_subnets=args.max_diagram_subnets,
+        )
+        name = "00-network-topology.d2"
+        report.write_text(os.path.join(out_dir, name), content)
+        names.append(name)
+
     logger(
-        f"diagram: {name} ({len(model.edges)} network paths, "
+        f"diagram: {', '.join(names)} ({len(model.edges)} network paths, "
         f"{model.traced} allowed / {model.blocked} blocked / "
         f"{model.conditional} unknown workload paths)"
     )
-    return [name], model
+    return names, model
 
 
 def write_reports(
@@ -416,6 +442,8 @@ def print_summary(
     if diagram_index:
         print(f"  start at: {os.path.join(out_dir, 'START-HERE.md')}")
         print(f"  topology: {os.path.join(out_dir, diagram_index[0])}")
+        if any(name.endswith(".d2") for name in diagram_index):
+            print(f"  topology: {os.path.join(out_dir, '00-network-topology.d2')}")
         print("  (one diagram for the whole account: location + traffic paths)")
     if args.reports:
         print(f"  reports:  {os.path.join(out_dir, 'reports', 'routes.csv')} (+8 more)")
@@ -423,6 +451,8 @@ def print_summary(
         print("  (add --reports for CSV/Markdown evidence)")
     print()
     print("View it: open https://mermaid.live and paste the .mmd text.")
+    if args.d2:
+        print("         or https://play.d2lang.com and paste the .d2 text.")
 
 
 def run_self_test(verbose: bool = True) -> int:

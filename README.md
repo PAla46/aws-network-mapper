@@ -19,7 +19,7 @@ Then paste `./network-map/00-network-topology.mmd` into
 No AWS account handy?
 
 ```bash
-python3 aws_network_mapper.py --self-test     # 225 offline checks, no AWS calls
+python3 aws_network_mapper.py --self-test     # 244 offline checks, no AWS calls
 python3 aws_network_mapper.py --demo --out ./demo
 ```
 
@@ -59,6 +59,7 @@ Default output is **one diagram** and a short index. Nothing else:
 ```
 <out>/
   00-network-topology.mmd   THE diagram: the whole account, one picture
+  00-network-topology.d2    the same picture in D2 (only with --d2)
   START-HERE.md             how to read it, plus every finding in a table
   logs/run.log              collection log, including any denied API call
   .cache/                   raw API responses, for offline rebuilds
@@ -102,6 +103,26 @@ no picture. The counts are printed to the console instead:
 The `.mmd` file does carry `%%` comment lines explaining how to read it. Those
 are Mermaid comments: they render as nothing at all, and they are what makes a
 pasted diagram self-explanatory.
+
+### Also available as D2
+
+With `--d2`, the *same* flow model is written a second time as D2 text
+(`00-network-topology.d2`). Mermaid and D2 are both emitted from one shared
+scene, so they cannot disagree about a container, an arrow or a label; the
+self-test asserts the two draw the same arrows.
+
+D2 is worth having because it lets **you** choose the layout engine:
+
+```
+d2 --layout=elk   00-network-topology.d2   # default in the file header
+d2 --layout=dagre 00-network-topology.d2   # classic
+d2 --layout=tala  00-network-topology.d2   # architecture look; better on deep nesting
+```
+
+The file is **text only, on purpose**. Emitting it is pure standard library, so
+it works on AWS CloudShell where there is no Go toolchain and no `d2` binary;
+render it at <https://play.d2lang.com> or with a local `d2`. Nothing about the
+default Mermaid output changes when `--d2` is off.
 
 ### Containers are location, arrows are traffic
 
@@ -404,7 +425,8 @@ internet, a security group open to everywhere, an orphaned NACL.
                         ec2-workloads, elbv2, rds, ecs, eks, lambda, core-only
 --max-workers N         parallel API calls per region (default: 8)
 --reports               also write the CSV/JSON/Markdown evidence files
---no-diagrams           skip the Mermaid diagram
+--no-diagrams           skip the diagram(s)
+--d2                    also write the topology as D2 text (00-network-topology.d2)
 --no-rules              skip the findings that annotate it
 --deep                  evaluate more cross-VPC pairs for the reports
 --max-vpc-pairs N       cap on cross-VPC evaluations (default: 500)
@@ -539,13 +561,15 @@ src/mapper/
   rules/                the rules above, with their IDs and severities
   render/               artefact writers
     kinds.py            one row per workload kind: label, shape, detail lines
-    mermaid.py          the single topology renderer
+    scene.py            content shared by both renderers (palette, titles, classes)
+    mermaid.py          the topology as Mermaid (the default)
+    d2.py               the same topology as D2 text (opt-in: --d2)
     reports.py          CSV, JSON and Markdown writers
   util/
     cidr.py             CIDR and IP helpers, longest-prefix match
 
 tests/                  offline checks; not part of the installed package
-  suite.py              the 225 checks
+  suite.py              the 244 checks
   scenario.py           synthetic two-region demo scenario
   fake_aws.py           boto3 stand-in used by --demo and the suite
 ```
@@ -596,7 +620,7 @@ The dependency direction is one-way: `discovery → model`, then
 ### Running the checks
 
 ```bash
-python3 run_tests.py                    # the 225 offline checks
+python3 run_tests.py                    # the 244 offline checks
 python3 aws_network_mapper.py --demo --reports --out ./demo   # no AWS access
 python3 aws_network_mapper.py --all-regions --out ./map       # live, read-only
 ```

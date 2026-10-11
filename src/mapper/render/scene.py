@@ -55,6 +55,18 @@ PALETTE: Dict[str, Style] = {
 }
 
 
+# Subnet draw order within an availability zone: public, then private, then
+# isolated. Shared so both renderers order a VPC the same way.
+CLASS_ORDER = {"public": 0, "private": 1, "isolated": 2}
+
+# Hard ceiling on subnets drawn per VPC, independent of --max-diagram-subnets.
+MAX_TOPOLOGY_SUBNETS = 400
+
+
+def trunc(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
 def service_short(service_name: str) -> str:
     """``com.amazonaws.eu-west-1.ecr.api`` -> ``ecr.api`` (not just ``api``)."""
     parts = [p for p in service_name.split(".") if p]
